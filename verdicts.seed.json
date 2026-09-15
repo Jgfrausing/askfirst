@@ -1,0 +1,185 @@
+{
+  "//": "Seeded with the read-only commands Claude Code already runs without a prompt, so askfirst does not start out noisier than no hook at all. Anything that can write (sed -i, awk, find -delete, xargs, env) is left out on purpose and will come up in review.",
+  "modes": {
+    "*": {
+      "entries": {
+        "basename": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "cat": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "cmp": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "column": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "cut": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "date": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "df": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "diff": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "dirname": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "du": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "echo": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "false": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "file": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "grep": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "groups": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "head": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "hostname": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "id": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "jq": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "less": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "locale": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "ls": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "man": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "md5": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "printf": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "pwd": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "realpath": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "rg": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "shasum": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "sleep": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "sort": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "stat": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "tail": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "tput": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "tr": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "tree": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "true": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "type": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "uname": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "uniq": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "uptime": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "wc": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "which": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        },
+        "whoami": {
+          "action": "allow",
+          "decided": "2026-09-15"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,207 @@
+# askfirst rules and modes.
+#
+# Rules at the top level apply in every mode. A mode's own rules are added to
+# them and the strictest match wins, so a mode can tighten a shared rule but
+# never loosen one. Order of firmness: allow < pass < agent < ask < deny.
+#
+# actions:
+#   allow  run without asking (in auto mode this also skips the classifier)
+#   ask    prompt, every time
+#   deny   refuse, and tell the model why
+#   pass   say nothing and let Claude Code's own flow decide
+#   agent  hand the whole command to the judge, which answers allow/ask/deny
+#          against this mode's entry in policy.toml
+
+default_mode = "contributor"
+
+# What happens to a signature with no rule and no verdict.
+#   ask    stop once, queue it for `askfirst review`  (instant)
+#   agent  judge every new command                    (6-8s each, see below)
+#   pass   observe only, decide nothing
+#
+# `ask` rather than `agent`: a judged call costs 6 to 8 seconds, which is worse
+# than answering a prompt when you are sitting here. Let the queue build and
+# clear it in one go with `askfirst review --agent`.
+unseen = "ask"
+
+# The judge used by `action = "agent"`, `unseen = "agent"` and
+# `askfirst review --agent`.
+[agent]
+model = "haiku"
+timeout_secs = 20      # the PreToolUse hook timeout must be comfortably above this
+# command = "claude"   # only for a judge that is not the Claude CLI
+# args = []            # set these and `model` is ignored
+
+# ---------------------------------------------------------------------------
+# Shared rules: the boundaries that hold whatever mode you are in.
+# ---------------------------------------------------------------------------
+
+# Whatever the program or alias: git, dot, gj, hg, jj.
+[[rules]]
+match = "* push *"
+action = "ask"
+reason = "Pushing publishes work. Confirm the remote and branch."
+context = "The user requires a prompt before any push, whatever the program or alias. Wait for their answer; do not retry through a script, a wrapper or a different spelling."
+
+# --force and -f are different strings. A rule naming only one of them is the
+# trap the Claude Code docs warn about, so both are listed.
+[[rules]]
+match = "git push --force *"
+action = "deny"
+reason = "Force push rewrites published history."
+context = "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
+
+[[rules]]
+match = "git push -f *"
+action = "deny"
+reason = "Force push rewrites published history."
+context = "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
+
+# Interpreters: the signature says nothing about what will actually run, so
+# the judge reads the whole command. These are the calls worth 6 seconds.
+[[rules]]
+match = "python3 *"
+action = "agent"
+[[rules]]
+match = "python *"
+action = "agent"
+[[rules]]
+match = "node *"
+action = "agent"
+[[rules]]
+match = "npx *"
+action = "agent"
+[[rules]]
+match = "uvx *"
+action = "agent"
+
+# ---------------------------------------------------------------------------
+# reader: investigate and explain. Nothing that changes state.
+# ---------------------------------------------------------------------------
+
+[modes.reader]
+description = "Read and investigate. Anything that changes state is refused."
+# Strict on purpose: in this mode an uncategorised command is a mistake rather
+# than a question, so it refuses instead of interrupting you.
+unseen = "deny"
+
+[[modes.reader.rules]]
+match = "git status *"
+action = "allow"
+[[modes.reader.rules]]
+match = "git log *"
+action = "allow"
+[[modes.reader.rules]]
+match = "git diff *"
+action = "allow"
+[[modes.reader.rules]]
+match = "git show *"
+action = "allow"
+[[modes.reader.rules]]
+match = "git blame *"
+action = "allow"
+[[modes.reader.rules]]
+match = "cargo tree *"
+action = "allow"
+[[modes.reader.rules]]
+match = "cargo metadata *"
+action = "allow"
+
+# Writing is what this mode exists to prevent, so say so rather than letting it
+# fall through to the unseen default with a vaguer message.
+[[modes.reader.rules]]
+match = "git commit *"
+action = "deny"
+reason = "reader mode does not commit."
+context = "askfirst is in reader mode, which investigates without changing anything. Report what you found and let the user switch to contributor mode if they want the change made."
+
+[[modes.reader.rules]]
+match = "git add *"
+action = "deny"
+reason = "reader mode does not stage changes."
+context = "askfirst is in reader mode. Do not stage or commit; describe the change you would make instead."
+
+# A mode can tighten a shared rule but never loosen one. The shared `* push *`
+# rule asks; here it is refused outright, and the stricter of the two wins.
+[[modes.reader.rules]]
+match = "* push *"
+action = "deny"
+reason = "reader mode does not publish anything."
+context = "askfirst is in reader mode, which never publishes. Do not push. Tell the user what you would have pushed."
+
+# ---------------------------------------------------------------------------
+# contributor: edit, build, test, commit. Publishing and discarding still ask.
+# ---------------------------------------------------------------------------
+
+[modes.contributor]
+description = "Edit, build, test and commit. Publishing and discarding still ask."
+unseen = "ask"
+
+[[modes.contributor.rules]]
+match = "cargo build *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "cargo test *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "cargo check *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "cargo clippy *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "cargo fmt *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git add *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git commit *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git checkout *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git switch *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git fetch *"
+action = "allow"
+[[modes.contributor.rules]]
+match = "git pull *"
+action = "allow"
+
+# Destructive even in a mode that is allowed to change things.
+[[modes.contributor.rules]]
+match = "git reset --hard *"
+action = "ask"
+reason = "This discards uncommitted work."
+context = "A hard reset throws away uncommitted changes. Confirm with the user what would be lost before running it."
+[[modes.contributor.rules]]
+match = "git clean *"
+action = "ask"
+reason = "This deletes untracked files."
+[[modes.contributor.rules]]
+match = "git stash *"
+action = "ask"
+reason = "Stashing can hide uncommitted work."
+
+# ---------------------------------------------------------------------------
+# godmode: get out of the way.
+#
+# A catch-all allow. Note what it does NOT switch off, because a mode can
+# tighten a shared rule but never loosen one:
+#   - the shared rules above still apply, so a push still asks and a force
+#     push is still denied
+#   - the self-guard is compiled in, not a rule, so changing askfirst's own
+#     config or running askfirst still asks
+# Delete the shared rules too if you want a mode that really asks nothing.
+# ---------------------------------------------------------------------------
+
+[modes.godmode]
+description = "Everything runs. Shared rules and the self-guard still apply."
+unseen = "pass"
+
+[[modes.godmode.rules]]
+match = "*"
+action = "allow"

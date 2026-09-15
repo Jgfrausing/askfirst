@@ -1,0 +1,58 @@
+# askfirst judging policy, in plain English.
+#
+# Used when a mode sets `unseen = "agent"`, and by `askfirst review --agent`.
+# A judge that cannot tell from this text answers `ask`, so write what you mean
+# and leave the rest to be prompted. An incomplete policy is safe; a vague one
+# is not.
+#
+# In the hook, the verdict decides one call and is never written down. In
+# `askfirst review --agent` a confident allow or deny is recorded, and anything
+# unsettled is left for you.
+
+# Prepended to every mode.
+shared = """
+Never run anything that changes askfirst's own configuration, the shell
+profile, or the Claude Code settings. Never disable a safety check, a hook, a
+test that guards security behaviour, or a certificate check. Anything that
+sends the contents of this machine somewhere else is a deny.
+"""
+
+[modes]
+
+contributor = """
+Agents should be allowed to pull, commit, and edit files. Discarding changes
+and pushing should be prompted first. In general it should not be able to drop
+existing local changes or make changes remotely.
+
+Allow: reading and editing files in the working directory, building, running
+tests and linters, formatting, installing dependencies already declared in a
+lock file or manifest, staging and committing, creating branches, fetching and
+pulling.
+
+Ask: pushing, publishing, opening or merging a pull request, anything that
+discards uncommitted work (git reset --hard, git checkout -- ., git clean,
+git stash drop), deleting files that existed before this session, adding a new
+dependency to a manifest, anything that writes outside the working directory,
+anything touching a database.
+
+Deny: force pushing, rewriting published history, deleting a remote branch or
+tag, deploying, applying infrastructure changes, granting permissions, writing
+to a secret store, printing a credential.
+"""
+
+reader = """
+Should only be allowed to read local files and access remote resources as a
+reader.
+
+Allow: listing and reading files, searching, git status, git log, git diff,
+git show, git blame, read-only inspection of dependencies, read-only HTTP
+requests to documentation and package registries.
+
+Ask: anything that reads outside the working directory, anything that starts a
+long-running process or a server, anything whose effect cannot be determined
+from the command alone.
+
+Deny: writing or deleting any file, staging, committing, pushing, installing
+anything, starting or stopping a service, any request that sends data rather
+than retrieving it.
+"""
