@@ -1,9 +1,10 @@
 //! Hand-written rules and the modes they live in, read fresh on every call.
 //!
 //! A mode is a named posture: what you are letting the agent do right now.
-//! `reader` investigates, `contributor` changes things. Rules written at the
-//! top level apply in every mode and are the invariants you never want a mode
-//! to loosen; rules inside a mode apply only while that mode is active.
+//! `reader` investigates, `contributor` changes things. Every rule belongs to
+//! a mode and applies only while that mode is active. There is no shared tier
+//! above them: a boundary you want everywhere is written into each mode that
+//! should have it, where you can read it off the mode you are in.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,11 +14,6 @@ use crate::hook::Decision;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
-    /// Rules that apply in every mode. A mode can make a call stricter, never
-    /// looser, so these are the boundaries that hold whatever you switch to.
-    #[serde(default)]
-    pub rules: Vec<Rule>,
-
     /// What to do with a signature no rule and no verdict covers, when the
     /// active mode does not say.
     #[serde(default)]
@@ -30,17 +26,84 @@ pub struct Config {
     #[serde(default)]
     pub modes: BTreeMap<String, Mode>,
 
-    /// How to reach the model that judges an unseen command when `unseen` is
-    /// `"agent"`.
+    /// How to reach the model that decides an `agent` rule and an
+    /// `unseen = "agent"` command. Named `judge` because `agent` is an
+    /// action.
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub judge: JudgeConfig,
 }
 
-/// The judge askfirst spawns for `unseen = "agent"`. The prompt goes in on
-/// stdin and one word comes back on stdout.
+/// Rules grouped by what they do.
+///
+/// One group per action rather than a list of objects each carrying an
+/// `action`, so the file answers "what runs, what stops, what is refused"
+/// without being read line by line. `allow` and `pass` are bare patterns:
+/// neither needs anything said about it. `ask` and `deny` map a pattern to
+/// the sentence you see when a call stops and the model is given to explain
+/// it. `agent` maps a pattern to an extra line for the judge, which may be
+/// empty.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RuleSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ask: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deny: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent: BTreeMap<String, String>,
+}
+
+impl RuleSet {
+    /// Flatten the groups into rules. Order does not decide anything: when
+    /// several match, the firmest wins, and `first_match` breaks a tie on the
+    /// more specific pattern.
+    fn extend(&self, out: &mut Vec<Rule>) {
+        let text = |s: &String| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        for p in &self.allow {
+            out.push(Rule::bare(p, Action::Allow));
+        }
+        for p in &self.pass {
+            out.push(Rule::bare(p, Action::Pass));
+        }
+        for (p, extra) in &self.agent {
+            out.push(Rule {
+                pattern: p.clone(),
+                action: Action::Agent,
+                context: None,
+                prompt: text(extra),
+            });
+        }
+        for (p, why) in &self.ask {
+            out.push(Rule {
+                pattern: p.clone(),
+                action: Action::Ask,
+                context: text(why),
+                prompt: None,
+            });
+        }
+        for (p, why) in &self.deny {
+            out.push(Rule {
+                pattern: p.clone(),
+                action: Action::Deny,
+                context: text(why),
+                prompt: None,
+            });
+        }
+    }
+
+}
+
+/// The judge askfirst spawns for an `agent` rule and for `unseen = "agent"`.
+/// The prompt goes in on stdin and one word comes back on stdout.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct AgentConfig {
+pub struct JudgeConfig {
     /// Which model judges. Anything the `claude` CLI accepts for `--model`:
     /// an alias such as `haiku` or `sonnet`, or a full model id.
     pub model: String,
@@ -54,7 +117,7 @@ pub struct AgentConfig {
     pub timeout_secs: u64,
 }
 
-impl AgentConfig {
+impl JudgeConfig {
     /// The argument vector to spawn with: yours if you set any, otherwise one
     /// built around `model`.
     pub fn argv(&self) -> Vec<String> {
@@ -81,7 +144,7 @@ impl AgentConfig {
     }
 }
 
-impl Default for AgentConfig {
+impl Default for JudgeConfig {
     fn default() -> Self {
         Self {
             model: "haiku".into(),
@@ -100,23 +163,31 @@ pub struct Mode {
     /// Overrides the top-level `unseen` while this mode is active.
     #[serde(default)]
     pub unseen: Option<Unseen>,
-    #[serde(default)]
-    pub rules: Vec<Rule>,
+    /// Everything this mode decides, grouped by action.
+    #[serde(flatten)]
+    pub rules: RuleSet,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+/// One pattern and what it does, built from a group in the file.
+#[derive(Debug, Clone)]
 pub struct Rule {
     /// Space-separated words matched against the command's argv. `*` matches
     /// one word, and a trailing `*` matches any remaining words.
-    #[serde(rename = "match")]
     pub pattern: String,
     pub action: Action,
-    /// Shown to you on ask and deny. Reaches the model only on deny.
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// Reaches the model on every decision.
-    #[serde(default)]
+    /// Why, in your words. It is shown to you when the call stops and given
+    /// to the model, which is why there is one string rather than two: a
+    /// short reason and a longer context said the same thing twice.
     pub context: Option<String>,
+    /// `agent` rules only: an extra line of policy for the judge, about this
+    /// pattern alone.
+    pub prompt: Option<String>,
+}
+
+impl Rule {
+    fn bare(pattern: &str, action: Action) -> Self {
+        Self { pattern: pattern.to_string(), action, context: None, prompt: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -209,12 +280,17 @@ impl From<Unseen> for Decision {
 /// entry there supplies only its description.
 pub const GODMODE: &str = "godmode";
 
+/// The action groups a mode is written in.
+const GROUPS: [&str; 5] = ["allow", "pass", "agent", "ask", "deny"];
+
 impl Config {
-    /// Every rule in force right now: the shared ones plus the active mode's.
-    pub fn rules_for<'a>(&'a self, mode: &str) -> Vec<&'a Rule> {
-        let mut v: Vec<&Rule> = self.rules.iter().collect();
+    /// Every rule in force right now, which is the active mode's and nothing
+    /// else. A mode you have not defined has no rules, so `unseen` decides
+    /// everything in it.
+    pub fn rules_for(&self, mode: &str) -> Vec<Rule> {
+        let mut v = Vec::new();
         if let Some(m) = self.modes.get(mode) {
-            v.extend(m.rules.iter());
+            m.rules.extend(&mut v);
         }
         v
     }
@@ -230,6 +306,22 @@ impl Config {
     /// that denies everything can still be escaped.
     pub fn knows_mode(&self, mode: &str) -> bool {
         mode == GODMODE || self.modes.contains_key(mode)
+    }
+
+    /// Does this mode already decide this signature?
+    ///
+    /// Asked of the review queue: a signature waits until every mode has an
+    /// answer for it, and this is what an answer looks like. A rule that only
+    /// matches a longer command, such as `git push --force *` against the
+    /// signature `git push`, does not decide the signature.
+    pub fn covers(&self, mode: &str, signature: &str) -> bool {
+        let argv: Vec<String> = signature.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() {
+            return true;
+        }
+        self.rules_for(mode)
+            .iter()
+            .any(|r| crate::rules::matches(&r.pattern, &argv))
     }
 }
 
@@ -311,9 +403,12 @@ pub fn create_mode(name: &str) -> Result<(), String> {
         name.into(),
         serde_json::json!({
             "//": "unseen: ask, deny, pass, or agent (judged against this mode's policy entry)",
+            "//rules": "allow and pass are lists of patterns; ask, deny and agent map a pattern to a sentence (the judge's extra prompt, for agent)",
             "description": "",
             "unseen": "ask",
-            "rules": []
+            "allow": [],
+            "ask": {},
+            "deny": {}
         }),
     );
     write_value(&v)?;
@@ -337,7 +432,78 @@ pub fn create_mode(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the rule file./// Load the rule file. A missing file is not an error; a malformed one is,
+/// Write decisions into the rules file, in the modes they apply to.
+///
+/// This is what `askfirst review` does with your answers. They go in the same
+/// file, in the same groups, as the rules you write by hand: one place says
+/// what runs, and what review adds is something you can read, edit and delete
+/// like anything else in it.
+///
+/// Anything already in the file is left exactly as it is, comments included,
+/// because this edits the parsed JSON value rather than rewriting the file
+/// from a struct.
+pub fn add_rules(decisions: &[Decided]) -> Result<(), String> {
+    let mut v = read_value()?;
+    apply_decisions(&mut v, decisions)?;
+    write_value(&v)
+}
+
+/// The edit itself, separated from reading and writing the file so it can be
+/// tested on a value.
+fn apply_decisions(v: &mut serde_json::Value, decisions: &[Decided]) -> Result<(), String> {
+    let obj = v.as_object_mut().ok_or("rules file is not a JSON object")?;
+    let modes = obj
+        .entry("modes")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("\"modes\" is not a JSON object")?;
+    for d in decisions {
+        let mode = modes
+            .entry(d.mode.clone())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| format!("mode '{}' is not a JSON object", d.mode))?;
+        let group = d.action.label();
+        match d.action {
+            Action::Allow | Action::Pass => {
+                let list = mode
+                    .entry(group)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .ok_or_else(|| format!("'{group}' in mode '{}' is not a list", d.mode))?;
+                let entry = serde_json::Value::String(d.pattern.clone());
+                if !list.contains(&entry) {
+                    list.push(entry);
+                }
+            }
+            Action::Ask | Action::Deny | Action::Agent => {
+                let map = mode
+                    .entry(group)
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| format!("'{group}' in mode '{}' is not an object", d.mode))?;
+                map.insert(
+                    d.pattern.clone(),
+                    serde_json::Value::String(d.note.clone().unwrap_or_default()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One answer from review: what to write, where.
+pub struct Decided {
+    pub mode: String,
+    pub action: Action,
+    /// Already a pattern, not a signature: `cargo test *`, not `cargo test`.
+    pub pattern: String,
+    /// The sentence an `ask` or `deny` carries, or the judge's line for an
+    /// `agent` rule. Empty for `allow` and `pass`, which say nothing.
+    pub note: Option<String>,
+}
+
+/// Load the rule file. A missing file is not an error; a malformed one is,
 /// and the caller turns that into an `ask` rather than letting a typo
 /// silently disable the gate.
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -346,7 +512,42 @@ pub fn load(path: &Path) -> Result<Config, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(where_) = old_format(&value) {
+        // Unknown keys are ignored, so a file askfirst no longer understands
+        // would load as a config with fewer rules, or none, and say nothing.
+        // Refuse instead, which the caller turns into an ask.
+        return Err(format!(
+            "{}: rules at {where_}. Every rule belongs to a mode now, under \
+             modes.<name>, and is grouped by action there: `allow` and `pass` are lists \
+             of patterns, `ask` and `deny` map a pattern to a sentence, `agent` maps a \
+             pattern to an extra prompt for the judge. The judge's own settings are under \
+             `judge`. Write a boundary you want everywhere into each mode that should \
+             have it.",
+            path.display()
+        ));
+    }
+    serde_json::from_value(value).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Where a file still carries a shape askfirst has stopped reading.
+fn old_format(v: &serde_json::Value) -> Option<String> {
+    if v.get("rules").is_some_and(|r| r.is_array()) {
+        return Some("the top level".into());
+    }
+    // Rules used to be writable outside any mode, applying to all of them.
+    // They are ignored now, which would quietly drop a boundary, so say so.
+    if GROUPS.iter().any(|g| v.get(g).is_some()) {
+        return Some("the top level".into());
+    }
+    let modes = v.get("modes")?.as_object()?;
+    for (name, m) in modes {
+        if m.get("rules").is_some_and(|r| r.is_array()) {
+            return Some(format!("mode '{name}'"));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -358,16 +559,17 @@ mod tests {
             r#"{
               "default_mode": "contributor",
               "unseen": "ask",
-              "rules": [{ "match": "* push *", "action": "ask" }],
               "modes": {
                 "reader": {
                   "description": "Investigate only.",
                   "unseen": "deny",
-                  "rules": [{ "match": "git status *", "action": "allow" }]
+                  "allow": ["git status *"],
+                  "ask": { "* push *": "Confirm the remote." }
                 },
                 "contributor": {
                   "unseen": "ask",
-                  "rules": [{ "match": "cargo test *", "action": "allow" }]
+                  "allow": ["cargo test *"],
+                  "agent": { "python3 *": "scripts here only read." }
                 }
               }
             }"#,
@@ -376,12 +578,128 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_adds_its_rules_to_the_shared_ones() {
+    fn a_mode_is_the_only_place_rules_come_from() {
         let c = sample();
         assert_eq!(c.rules_for("reader").len(), 2);
         assert_eq!(c.rules_for("contributor").len(), 2);
-        // An unknown mode still gets the shared rules.
-        assert_eq!(c.rules_for("nonexistent").len(), 1);
+        // Nothing sits above the modes, so a mode you have not defined has no
+        // rules at all and `unseen` decides everything in it.
+        assert!(c.rules_for("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn each_group_becomes_its_action() {
+        let c = sample();
+        let asked = c
+            .rules_for("reader")
+            .into_iter()
+            .find(|r| r.action == Action::Ask)
+            .expect("the ask group");
+        assert_eq!(asked.pattern, "* push *");
+        assert_eq!(asked.context.as_deref(), Some("Confirm the remote."));
+
+        let judged = c
+            .rules_for("contributor")
+            .into_iter()
+            .find(|r| r.action == Action::Agent)
+            .expect("the agent group");
+        assert_eq!(judged.pattern, "python3 *");
+        assert_eq!(judged.prompt.as_deref(), Some("scripts here only read."));
+
+        let allowed = c
+            .rules_for("contributor")
+            .into_iter()
+            .find(|r| r.action == Action::Allow)
+            .expect("the allow group");
+        assert_eq!(allowed.pattern, "cargo test *");
+        assert!(allowed.context.is_none() && allowed.prompt.is_none());
+    }
+
+    #[test]
+    fn a_mode_covers_what_one_of_its_rules_matches() {
+        let c = sample();
+        assert!(c.covers("reader", "git status"));
+        assert!(c.covers("reader", "git push"));
+        // Nothing in reader answers for cargo, and nothing at all answers in a
+        // mode that does not exist.
+        assert!(!c.covers("reader", "cargo test"));
+        assert!(!c.covers("nonexistent", "git status"));
+        // A rule that only matches a longer command does not decide the
+        // signature itself.
+        let c: Config = serde_json::from_str(
+            r#"{"modes": {"m": {"deny": {"git push --force *": "no"}}}}"#,
+        )
+        .unwrap();
+        assert!(!c.covers("m", "git push"));
+    }
+
+    #[test]
+    fn a_decision_is_written_into_the_group_its_action_names() {
+        let mut v: serde_json::Value = serde_json::from_str(
+            r#"{"//": "keep me", "modes": {"reader": {"allow": ["ls *"]}}}"#,
+        )
+        .unwrap();
+        let decisions = vec![
+            Decided {
+                mode: "reader".into(),
+                action: Action::Allow,
+                pattern: "rg *".into(),
+                note: None,
+            },
+            Decided {
+                mode: "reader".into(),
+                action: Action::Deny,
+                pattern: "curl *".into(),
+                note: Some("reader does not fetch".into()),
+            },
+            Decided {
+                mode: "contributor".into(),
+                action: Action::Agent,
+                pattern: "python3 *".into(),
+                note: None,
+            },
+        ];
+        apply_decisions(&mut v, &decisions).unwrap();
+
+        // Comments and existing rules survive: this edits the value, it does
+        // not rewrite the file from a struct.
+        assert_eq!(v["//"], "keep me");
+        assert_eq!(v["modes"]["reader"]["allow"][0], "ls *");
+        assert_eq!(v["modes"]["reader"]["allow"][1], "rg *");
+        assert_eq!(v["modes"]["reader"]["deny"]["curl *"], "reader does not fetch");
+        // A mode that did not exist yet is created, and an agent rule with no
+        // line for the judge is an empty string.
+        assert_eq!(v["modes"]["contributor"]["agent"]["python3 *"], "");
+
+        // The same decision twice does not duplicate the pattern.
+        apply_decisions(&mut v, &decisions).unwrap();
+        assert_eq!(v["modes"]["reader"]["allow"].as_array().unwrap().len(), 2);
+
+        // And the result is still a config askfirst can read.
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert!(c.covers("reader", "rg"));
+        assert!(c.covers("contributor", "python3"));
+    }
+
+    #[test]
+    fn a_shape_askfirst_no_longer_reads_is_refused_rather_than_ignored() {
+        // Serde ignores unknown keys, so an unconverted file would otherwise
+        // load as a config with no rules and no complaint.
+        let dir = std::env::temp_dir().join("askfirst-test-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        for body in [
+            r#"{"rules": [{"match": "git push *", "action": "ask"}]}"#,
+            r#"{"modes": {"reader": {"rules": [{"match": "ls *", "action": "allow"}]}}}"#,
+            // Rules outside a mode, from when there was a shared tier.
+            r#"{"deny": {"git push --force *": "no"}}"#,
+            r#"{"allow": ["ls *"]}"#,
+        ] {
+            let p = dir.join("rules.json");
+            std::fs::write(&p, body).unwrap();
+            let e = load(&p).expect_err("should refuse the old shape");
+            assert!(e.contains("belongs to a mode"), "{e}");
+        }
+        let _ = std::fs::remove_file(dir.join("rules.json"));
     }
 
     #[test]
@@ -409,12 +727,28 @@ mod tests {
         let c: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(c.unseen, Unseen::Ask);
         assert!(c.modes.is_empty());
+        assert_eq!(c.judge.model, "haiku");
     }
 
     #[test]
     fn missing_file_is_an_empty_config() {
         let c = load(Path::new("/nonexistent/askfirst/rules.json")).unwrap();
-        assert!(c.rules.is_empty());
+        assert!(c.modes.is_empty());
+        assert!(c.rules_for("contributor").is_empty());
+    }
+
+    #[test]
+    fn the_judge_block_is_not_mistaken_for_an_agent_rule() {
+        // `agent` is an action group now, so the judge's own settings live
+        // under `judge`.
+        let c: Config = serde_json::from_str(
+            r#"{"judge": {"model": "sonnet", "timeout_secs": 9},
+                "modes": {"x": {"agent": {"npx *": ""}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.judge.model, "sonnet");
+        assert_eq!(c.judge.timeout_secs, 9);
+        assert_eq!(c.rules_for("x").len(), 1);
     }
 
     #[test]

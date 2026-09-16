@@ -1,185 +1,162 @@
 {
   "//": "askfirst rules. Keys starting with // are comments; askfirst ignores them.",
-  "//actions": "allow | ask | deny | pass | agent. Firmness: allow < pass < agent < ask < deny.",
+  "//rules": "Every rule belongs to a mode, grouped by action there. allow and pass are lists of patterns; ask and deny map a pattern to the sentence you are shown and the model is told; agent maps a pattern to an extra prompt for the judge (empty for none).",
+  "//firmness": "When several match: allow < pass < agent < ask < deny, then the more specific pattern.",
   "//unseen": "What happens to a signature with no rule and no verdict: ask (queue it, instant), agent (judge it, 6-8s), deny, or pass.",
+  "//askfirst": "askfirst's own commands ignore unseen and ask, in every mode, unless a rule names askfirst (a catch-all match does not count). Otherwise a mode with unseen=deny would refuse `askfirst mode <name>`, the only command that leaves it, without prompting.",
   "default_mode": "contributor",
   "unseen": "ask",
-  "agent": {
-    "//": "The judge for action=agent, unseen=agent and `askfirst review --agent`.",
+  "judge": {
+    "//": "The model behind an `agent` rule, `unseen = agent` and `askfirst review --agent`.",
     "//timeout": "Keep the PreToolUse hook timeout in settings.json comfortably above this.",
     "model": "haiku",
     "timeout_secs": 20
   },
-  "//rules": "Apply in every mode. A mode may tighten these, never loosen them.",
-  "rules": [
-    {
-      "match": "* push *",
-      "action": "ask",
-      "reason": "Pushing publishes work. Confirm the remote and branch.",
-      "context": "The user requires a prompt before any push, whatever the program or alias. Wait for their answer; do not retry through a script, a wrapper or a different spelling."
-    },
-    {
-      "match": "git push --force *",
-      "action": "deny",
-      "reason": "Force push rewrites published history.",
-      "context": "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
-    },
-    {
-      "match": "git push -f *",
-      "action": "deny",
-      "reason": "Force push rewrites published history.",
-      "context": "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
-    },
-    {
-      "match": "python3 *",
-      "action": "agent"
-    },
-    {
-      "match": "python *",
-      "action": "agent"
-    },
-    {
-      "match": "node *",
-      "action": "agent"
-    },
-    {
-      "match": "npx *",
-      "action": "agent"
-    },
-    {
-      "match": "uvx *",
-      "action": "agent"
-    }
-  ],
   "modes": {
     "reader": {
       "description": "Read and investigate. Anything that changes state is refused.",
       "unseen": "deny",
-      "rules": [
-        {
-          "match": "git status *",
-          "action": "allow"
-        },
-        {
-          "match": "git log *",
-          "action": "allow"
-        },
-        {
-          "match": "git diff *",
-          "action": "allow"
-        },
-        {
-          "match": "git show *",
-          "action": "allow"
-        },
-        {
-          "match": "git blame *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo tree *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo metadata *",
-          "action": "allow"
-        },
-        {
-          "match": "git commit *",
-          "action": "deny",
-          "reason": "reader mode does not commit.",
-          "context": "askfirst is in reader mode, which investigates without changing anything. Report what you found and let the user switch to contributor mode if they want the change made."
-        },
-        {
-          "match": "git add *",
-          "action": "deny",
-          "reason": "reader mode does not stage changes.",
-          "context": "askfirst is in reader mode. Do not stage or commit; describe the change you would make instead."
-        },
-        {
-          "match": "* push *",
-          "action": "deny",
-          "reason": "reader mode does not publish anything.",
-          "context": "askfirst is in reader mode, which never publishes. Do not push. Tell the user what you would have pushed."
-        }
-      ]
+      "allow": [
+        "git status *",
+        "git log *",
+        "git diff *",
+        "git show *",
+        "git blame *",
+        "cargo tree *",
+        "cargo metadata *",
+        "basename *",
+        "cat *",
+        "cmp *",
+        "column *",
+        "cut *",
+        "date *",
+        "df *",
+        "diff *",
+        "dirname *",
+        "du *",
+        "echo *",
+        "false *",
+        "file *",
+        "grep *",
+        "groups *",
+        "head *",
+        "hostname *",
+        "id *",
+        "jq *",
+        "less *",
+        "locale *",
+        "ls *",
+        "man *",
+        "md5 *",
+        "printf *",
+        "pwd *",
+        "realpath *",
+        "rg *",
+        "shasum *",
+        "sleep *",
+        "sort *",
+        "stat *",
+        "tail *",
+        "tput *",
+        "tr *",
+        "tree *",
+        "true *",
+        "type *",
+        "uname *",
+        "uniq *",
+        "uptime *",
+        "wc *",
+        "which *",
+        "whoami *"
+      ],
+      "deny": {
+        "git commit *": "reader mode does not commit. It investigates without changing anything: report what you found, and let the user switch to contributor mode if they want the change made.",
+        "git add *": "reader mode does not stage changes. Describe the change you would make instead.",
+        "* push *": "reader mode never publishes. Do not push; tell the user what you would have pushed."
+      }
     },
     "contributor": {
       "description": "Edit, build, test and commit. Publishing and discarding still ask.",
       "unseen": "ask",
-      "rules": [
-        {
-          "match": "cargo build *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo test *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo check *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo clippy *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo fmt *",
-          "action": "allow"
-        },
-        {
-          "match": "git add *",
-          "action": "allow"
-        },
-        {
-          "match": "git commit *",
-          "action": "allow"
-        },
-        {
-          "match": "git checkout *",
-          "action": "allow"
-        },
-        {
-          "match": "git switch *",
-          "action": "allow"
-        },
-        {
-          "match": "git fetch *",
-          "action": "allow"
-        },
-        {
-          "match": "git pull *",
-          "action": "allow"
-        },
-        {
-          "match": "git reset --hard *",
-          "action": "ask",
-          "reason": "This discards uncommitted work.",
-          "context": "A hard reset throws away uncommitted changes. Confirm with the user what would be lost before running it."
-        },
-        {
-          "match": "git clean *",
-          "action": "ask",
-          "reason": "This deletes untracked files."
-        },
-        {
-          "match": "git stash *",
-          "action": "ask",
-          "reason": "Stashing can hide uncommitted work."
-        }
-      ]
+      "allow": [
+        "cargo build *",
+        "cargo test *",
+        "cargo check *",
+        "cargo clippy *",
+        "cargo fmt *",
+        "git add *",
+        "git commit *",
+        "git checkout *",
+        "git switch *",
+        "git fetch *",
+        "git pull *",
+        "basename *",
+        "cat *",
+        "cmp *",
+        "column *",
+        "cut *",
+        "date *",
+        "df *",
+        "diff *",
+        "dirname *",
+        "du *",
+        "echo *",
+        "false *",
+        "file *",
+        "grep *",
+        "groups *",
+        "head *",
+        "hostname *",
+        "id *",
+        "jq *",
+        "less *",
+        "locale *",
+        "ls *",
+        "man *",
+        "md5 *",
+        "printf *",
+        "pwd *",
+        "realpath *",
+        "rg *",
+        "shasum *",
+        "sleep *",
+        "sort *",
+        "stat *",
+        "tail *",
+        "tput *",
+        "tr *",
+        "tree *",
+        "true *",
+        "type *",
+        "uname *",
+        "uniq *",
+        "uptime *",
+        "wc *",
+        "which *",
+        "whoami *"
+      ],
+      "agent": {
+        "python3 *": "",
+        "python *": "",
+        "node *": "",
+        "npx *": "npx fetches a package from the network and runs it. Allow a pinned, well-known package that only builds or formats; anything unfamiliar or unpinned is ask.",
+        "uvx *": "uvx fetches a package from the network and runs it. Allow a pinned, well-known package that only builds or formats; anything unfamiliar or unpinned is ask."
+      },
+      "ask": {
+        "* push *": "Pushing publishes work. Confirm the remote and branch with the user, whatever the program or alias. Wait for their answer; do not retry through a script, a wrapper or a different spelling.",
+        "git reset --hard *": "This discards uncommitted work. Confirm with the user what would be lost before running it.",
+        "git clean *": "This deletes untracked files.",
+        "git stash *": "Stashing can hide uncommitted work."
+      },
+      "deny": {
+        "git push --force *": "Force push rewrites published history, so it is refused. Use --force-with-lease and ask the user first, or rebase locally and push normally.",
+        "git push -f *": "Force push rewrites published history, so it is refused. Use --force-with-lease and ask the user first, or rebase locally and push normally."
+      }
     },
     "godmode": {
-      "description": "Everything runs. Shared rules and the self-guard still apply.",
+      "description": "Everything runs. The self-guard still applies.",
       "unseen": "pass",
-      "rules": [
-        {
-          "match": "*",
-          "action": "allow"
-        }
-      ],
-      "//": "A catch-all allow. The shared rules still apply (a push still asks, a force push is still denied) and the self-guard is compiled in, so askfirst's own config still asks."
+      "//": "Its meaning is fixed in the binary: it allows everything, and this entry supplies only the description. The self-guard is compiled in, so askfirst's own config still asks."
     }
   }
 }

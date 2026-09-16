@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::AgentConfig;
+use crate::config::JudgeConfig;
 use crate::hook::Decision;
 
 /// Set while the judge runs, so a nested askfirst cannot call a model that
@@ -115,10 +115,11 @@ pub fn parse_verdict(out: &str) -> Decision {
 
 /// Run the judge. Any failure is `ask`.
 pub fn judge(
-    agent: &AgentConfig,
+    judge: &JudgeConfig,
     mode: &str,
     command: &str,
     cwd: &str,
+    extra: Option<&str>,
 ) -> (Decision, Option<String>) {
     if std::env::var(GUARD_VAR).is_ok() {
         return (Decision::Ask, Some("askfirst judge called itself".into()));
@@ -134,8 +135,15 @@ pub fn judge(
         );
     };
 
+    // A rule may carry a line of its own about the pattern it matches, which
+    // is policy for this command and nothing else. It joins the mode's policy
+    // rather than the command block, which is data the judge must not follow.
+    let policy = match extra {
+        Some(e) if !e.trim().is_empty() => format!("{policy}\n\nFor this command: {}", e.trim()),
+        _ => policy,
+    };
     let prompt = prompt_for(&policy, mode, command, cwd);
-    match run(agent, &prompt) {
+    match run(judge, &prompt) {
         Ok(out) => {
             let d = parse_verdict(&out);
             (d, Some(format!("the {mode} policy judged this '{}'", label(d))))
@@ -152,9 +160,9 @@ fn label(d: Decision) -> &'static str {
     }
 }
 
-fn run(agent: &AgentConfig, prompt: &str) -> Result<String, String> {
-    let mut child = Command::new(&agent.command)
-        .args(agent.argv())
+fn run(judge: &JudgeConfig, prompt: &str) -> Result<String, String> {
+    let mut child = Command::new(&judge.command)
+        .args(judge.argv())
         .env(GUARD_VAR, "1")
         // A nested session must not inherit this one's identity as a parent,
         // and must not run our hooks again.
@@ -163,13 +171,13 @@ fn run(agent: &AgentConfig, prompt: &str) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("{}: {e}", agent.command))?;
+        .map_err(|e| format!("{}: {e}", judge.command))?;
 
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(prompt.as_bytes());
     } // dropped here, closing stdin so the child can start
 
-    let deadline = Instant::now() + Duration::from_secs(agent.timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(judge.timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -187,7 +195,7 @@ fn run(agent: &AgentConfig, prompt: &str) -> Result<String, String> {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("timed out after {}s", agent.timeout_secs));
+                    return Err(format!("timed out after {}s", judge.timeout_secs));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -256,8 +264,8 @@ mod tests {
     #[test]
     fn a_recursive_call_asks_without_spawning_anything() {
         std::env::set_var(GUARD_VAR, "1");
-        let cfg = AgentConfig::default();
-        let (d, why) = judge(&cfg, "contributor", "ls", "/tmp");
+        let cfg = JudgeConfig::default();
+        let (d, why) = judge(&cfg, "contributor", "ls", "/tmp", None);
         std::env::remove_var(GUARD_VAR);
         assert_eq!(d, Decision::Ask);
         assert!(why.unwrap().contains("called itself"));
@@ -265,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_judge_that_cannot_run_asks() {
-        let cfg = AgentConfig {
+        let cfg = JudgeConfig {
             command: "definitely-not-a-real-program-xyz".into(),
             args: vec!["--no-op".into()],
             ..Default::default()
@@ -275,7 +283,7 @@ mod tests {
 
     #[test]
     fn a_judge_that_hangs_is_killed_and_asks() {
-        let cfg = AgentConfig {
+        let cfg = JudgeConfig {
             command: "sleep".into(),
             args: vec!["30".into()],
             timeout_secs: 1,

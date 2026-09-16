@@ -74,7 +74,7 @@ fn own_names() -> Vec<String> {
 /// because it can find out where a boundary is instead of walking into it.
 /// Every other subcommand either writes state or is a bare invocation that
 /// would append to the queue, so all of them ask.
-const READ_ONLY_SUBCOMMANDS: &[&str] = &["check", "--check"];
+const READ_ONLY_SUBCOMMANDS: &[&str] = &["check"];
 
 /// Is this command an invocation of askfirst that should ask?
 ///
@@ -97,6 +97,21 @@ pub fn invokes_self(argv: &[String]) -> Option<String> {
         }
     }
     Some(first.clone())
+}
+
+/// Does this rule pattern name askfirst as the program it decides?
+///
+/// A rule has to name askfirst to say what running askfirst does. A wildcard
+/// that happens to sweep it up, `*` or `* mode *`, does not: those are written
+/// about other commands, and letting one of them allow `askfirst mode` would
+/// widen the gate by accident.
+pub fn pattern_names_self(pattern: &str) -> bool {
+    let Some(first) = pattern.split_whitespace().next() else { return false };
+    let name = Path::new(first)
+        .file_name()
+        .and_then(|o| o.to_str())
+        .unwrap_or(first);
+    own_names().iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// Does this command name any protected path?
@@ -249,12 +264,24 @@ mod tests {
     #[test]
     fn check_is_the_one_subcommand_that_does_not_ask() {
         assert!(invokes_self(&words("askfirst check ls")).is_none());
-        assert!(invokes_self(&words("askfirst --check ls")).is_none());
         // Everything else, including a bare call that would append to the queue.
         assert!(invokes_self(&words("askfirst")).is_some());
         assert!(invokes_self(&words("askfirst modes")).is_some());
         assert!(invokes_self(&words("askfirst pending")).is_some());
         assert!(invokes_self(&words("askfirst paths")).is_some());
+    }
+
+    #[test]
+    fn only_a_pattern_naming_askfirst_decides_askfirst() {
+        assert!(pattern_names_self("askfirst *"));
+        assert!(pattern_names_self("askfirst mode *"));
+        assert!(pattern_names_self("/usr/local/bin/askfirst *"));
+        // A wildcard written about other commands sweeps askfirst up without
+        // naming it, and must not decide what running the gate does.
+        assert!(!pattern_names_self("*"));
+        assert!(!pattern_names_self("* mode *"));
+        assert!(!pattern_names_self("git *"));
+        assert!(!pattern_names_self(""));
     }
 
     #[test]

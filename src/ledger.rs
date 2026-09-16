@@ -1,10 +1,10 @@
-//! What askfirst has seen before, and what you decided about it, per mode.
+//! What askfirst has seen and has no answer for yet.
 //!
-//! A verdict belongs to the mode you gave it in. What you allowed as
-//! `contributor` is not automatically allowed as `reader`, which is the point
-//! of having modes at all. A verdict recorded under `*` applies in every mode.
+//! The queue, the current mode and the sessions it belongs to. What you decide
+//! is not here: `askfirst review` writes it into the rules file, in the mode it
+//! applies to, so there is one place that says what runs.
 //!
-//! Only `askfirst review` writes a verdict. The hook appends observations and
+//! Only `askfirst review` writes a rule. The hook appends observations and
 //! nothing else, so the agent cannot widen its own permissions by running a
 //! command: running it is exactly what puts it in the queue.
 
@@ -12,11 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
-
-use crate::config::Action;
-
-/// A verdict under this key applies whatever mode is active.
-pub const ALL_MODES: &str = "*";
 
 /// A command reduced to the granularity you review at: the program and its
 /// first non-flag word, when that word is a plain identifier.
@@ -45,67 +40,18 @@ fn is_subcommand_word(w: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
 }
 
-/// The program-only form of a signature, for when one verdict should cover
-/// every subcommand.
+/// The program-only form of a signature, for when one rule should cover every
+/// subcommand.
 pub fn broaden(sig: &str) -> String {
     sig.split_whitespace().next().unwrap_or(sig).to_string()
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Verdicts {
-    #[serde(default)]
-    pub modes: BTreeMap<String, ModeVerdicts>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct ModeVerdicts {
-    #[serde(default)]
-    pub entries: BTreeMap<String, Entry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entry {
-    pub action: Action,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decided: Option<String>,
-}
-
-impl Verdicts {
-    /// The verdict in force for this signature: the mode's own entry, then the
-    /// mode's program-wide entry, then the same two under `*`.
-    pub fn lookup(&self, mode: &str, sig: &str) -> Option<&Entry> {
-        let broad = broaden(sig);
-        for scope in [mode, ALL_MODES] {
-            let Some(m) = self.modes.get(scope) else { continue };
-            if let Some(e) = m.entries.get(sig) {
-                return Some(e);
-            }
-            if let Some(e) = m.entries.get(&broad) {
-                return Some(e);
-            }
-        }
-        None
-    }
-
-    pub fn set(&mut self, mode: &str, sig: &str, entry: Entry) {
-        self.modes
-            .entry(mode.to_string())
-            .or_default()
-            .entries
-            .insert(sig.to_string(), entry);
-    }
-}
-
-/// One sighting of a signature the verdict file does not cover.
+/// One sighting of a signature no rule covers yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sighting {
     pub signature: String,
     pub example: String,
-    /// The mode that was active when it came up, so review decides in context.
-    #[serde(default)]
-    pub mode: String,
+
 }
 
 /// The queue is JSON Lines: one object per line.
@@ -122,10 +68,6 @@ fn read_pending() -> Vec<Sighting> {
             .collect(),
         Err(_) => Vec::new(),
     }
-}
-
-pub fn verdicts_path() -> PathBuf {
-    crate::config::dir().join("verdicts.json")
 }
 
 pub fn pending_path() -> PathBuf {
@@ -289,27 +231,9 @@ pub fn set_mode(mode: &str) -> Result<(), String> {
     save_state(&st)
 }
 
-pub fn load_verdicts() -> Verdicts {
-    match std::fs::read_to_string(verdicts_path()) {
-        Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
-        Err(_) => Verdicts::default(),
-    }
-}
-
-pub fn save_verdicts(v: &Verdicts) -> Result<(), String> {
-    let path = verdicts_path();
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
-    let body = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{body}\n")).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
-}
-
 /// Append a sighting. Best effort: a hook that cannot write its queue still
 /// returns its decision rather than failing the tool call.
-pub fn record_sighting(signature: &str, example: &str, mode: &str) {
+pub fn record_sighting(signature: &str, example: &str) {
     let path = pending_path();
     if let Some(d) = path.parent() {
         if std::fs::create_dir_all(d).is_err() {
@@ -319,7 +243,6 @@ pub fn record_sighting(signature: &str, example: &str, mode: &str) {
     let line = match serde_json::to_string(&Sighting {
         signature: signature.to_string(),
         example: example.chars().take(400).collect(),
-        mode: mode.to_string(),
     }) {
         Ok(l) => l,
         Err(_) => return,
@@ -329,15 +252,15 @@ pub fn record_sighting(signature: &str, example: &str, mode: &str) {
     }
 }
 
-/// Signatures seen in `mode` but not yet decided there, most-seen first.
-pub fn pending(mode: &str) -> Vec<(String, String, usize)> {
-    let verdicts = load_verdicts();
+/// Signatures seen but not yet decided, most-seen first.
+///
+/// One queue, whatever mode each sighting came up in. A signature waits until
+/// every mode has a rule for it, so reviewing it once in front of you is the
+/// shorter path than asking you the same question per mode.
+pub fn pending(cfg: &crate::config::Config) -> Vec<(String, String, usize)> {
     let mut counts: BTreeMap<String, (String, usize)> = BTreeMap::new();
     for s in read_pending() {
-        if s.mode != mode {
-            continue;
-        }
-        if verdicts.lookup(mode, &s.signature).is_some() {
+        if decided(cfg, &s.signature) {
             continue;
         }
         let e = counts.entry(s.signature).or_insert((s.example.clone(), 0));
@@ -349,29 +272,28 @@ pub fn pending(mode: &str) -> Vec<(String, String, usize)> {
     v
 }
 
-/// Every mode that has something waiting, with its count.
-pub fn pending_modes() -> Vec<(String, usize)> {
-    let verdicts = load_verdicts();
-    let mut per_mode: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
-    for s in read_pending() {
-        if verdicts.lookup(&s.mode, &s.signature).is_some() {
-            continue;
-        }
-        per_mode.entry(s.mode).or_default().insert(s.signature);
-    }
-    per_mode.into_iter().map(|(m, s)| (m, s.len())).collect()
+/// Is this signature settled? Only when every mode you have written decides
+/// it, since a rule in one mode says nothing about the others. godmode is
+/// skipped: it allows everything and reads no rules, so it would settle
+/// everything on its own.
+fn decided(cfg: &crate::config::Config, signature: &str) -> bool {
+    let mut modes = cfg
+        .modes
+        .keys()
+        .filter(|m| *m != crate::config::GODMODE)
+        .peekable();
+    modes.peek().is_some() && modes.all(|m| cfg.covers(m, signature))
 }
 
-/// Drop sightings that now have a verdict in the mode they were seen in.
-pub fn prune_pending() -> Result<(), String> {
-    let verdicts = load_verdicts();
+/// Drop sightings that every mode now has a rule for.
+pub fn prune_pending(cfg: &crate::config::Config) -> Result<(), String> {
     let path = pending_path();
     if !path.exists() {
         return Ok(());
     }
     let kept: Vec<Sighting> = read_pending()
         .into_iter()
-        .filter(|s| verdicts.lookup(&s.mode, &s.signature).is_none())
+        .filter(|s| !decided(cfg, &s.signature))
         .collect();
     let mut body = String::new();
     for s in &kept {
@@ -391,10 +313,6 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
-    }
-
-    fn entry(a: Action) -> Entry {
-        Entry { action: a, note: None, decided: None }
     }
 
     #[test]
@@ -433,40 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_belongs_to_its_mode() {
-        let mut v = Verdicts::default();
-        v.set("contributor", "cargo build", entry(Action::Allow));
-        assert!(v.lookup("contributor", "cargo build").is_some());
-        assert!(
-            v.lookup("reader", "cargo build").is_none(),
-            "contributor's allow must not leak into reader"
-        );
+    fn a_sighting_from_when_the_queue_was_per_mode_still_reads() {
+        // pending.jsonl is appended to, never rewritten in place, so lines
+        // carrying the old `mode` field outlive the change.
+        let s: Sighting =
+            serde_json::from_str(r#"{"signature":"ls","example":"ls -la","mode":"reader"}"#)
+                .unwrap();
+        assert_eq!(s.signature, "ls");
+        assert_eq!(s.example, "ls -la");
     }
 
-    #[test]
-    fn an_all_modes_verdict_applies_everywhere() {
-        let mut v = Verdicts::default();
-        v.set(ALL_MODES, "ls", entry(Action::Allow));
-        assert!(v.lookup("reader", "ls").is_some());
-        assert!(v.lookup("contributor", "ls").is_some());
-    }
-
-    #[test]
-    fn the_modes_own_verdict_wins_over_the_shared_one() {
-        let mut v = Verdicts::default();
-        v.set(ALL_MODES, "cargo build", entry(Action::Deny));
-        v.set("contributor", "cargo build", entry(Action::Allow));
-        assert_eq!(
-            v.lookup("contributor", "cargo build").unwrap().action,
-            Action::Allow
-        );
-        assert_eq!(v.lookup("reader", "cargo build").unwrap().action, Action::Deny);
-    }
-
-    #[test]
-    fn a_program_wide_verdict_covers_subcommands() {
-        let mut v = Verdicts::default();
-        v.set("reader", "git", entry(Action::Allow));
-        assert!(v.lookup("reader", "git status").is_some());
-    }
 }

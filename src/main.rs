@@ -21,6 +21,8 @@ mod parse;
 mod rules;
 mod selfguard;
 
+use clap::{CommandFactory as _, Parser};
+use clap_complete_command::Shell;
 use config::Action;
 
 /// Tools that write a file directly. They never reach a shell, so the command
@@ -30,6 +32,82 @@ use hook::Decision;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 
+/// The command line.
+///
+/// With no arguments at all askfirst is the hook: it reads a Claude Code event
+/// on stdin and writes a decision on stdout. Everything below is for you.
+#[derive(Parser, Debug)]
+#[command(
+    name = "askfirst",
+    version,
+    about = "A PreToolUse hook for Claude Code that learns what you allow",
+    long_about = "A PreToolUse hook for Claude Code that learns what you allow.\n\n\
+                  With no arguments it reads a hook event on stdin and writes a decision on \
+                  stdout. A command it has not seen asks, and joins the review queue. What you \
+                  decide during review is written into the rules file as a rule.\n\n\
+                  Everything lives in one directory; `askfirst paths` prints it. ASKFIRST_HOME \
+                  moves that directory, ASKFIRST_MODE overrides the mode.",
+    disable_help_subcommand = true
+)]
+enum Cli {
+    /// Print the mode in force, or switch to one
+    Mode {
+        /// The mode to switch to. Omit to print the mode in force
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Switch for every session, not just this one
+        #[arg(short, long)]
+        global: bool,
+
+        /// Create the mode first, with `unseen = "ask"` and no rules
+        #[arg(short, long)]
+        create: bool,
+    },
+
+    /// Set the mode new sessions start in
+    #[command(name = "defaultmode")]
+    DefaultMode {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+
+    /// Write the default rules, the starter policy and the /askfirst skill
+    Install,
+
+    /// List the modes
+    Modes,
+
+    /// Categorise what is waiting, writing a rule for each answer
+    Review {
+        /// Let each mode's policy judge the queue instead of asking you
+        #[arg(short, long)]
+        agent: bool,
+
+        /// Removed: the queue is not per mode
+        #[arg(long, hide = true, value_name = "MODE")]
+        mode: Option<String>,
+    },
+
+    /// List what is waiting, without deciding anything
+    Pending,
+
+    /// Explain what would happen to one command, changing nothing
+    Check {
+        #[arg(value_name = "COMMAND")]
+        command: String,
+    },
+
+    /// Print the files askfirst uses
+    Paths,
+
+    /// Print a shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
 fn main() {
     // Rust ignores SIGPIPE, so `askfirst pending | head` panics instead of
     // ending quietly. Restore the default so this behaves like other CLIs.
@@ -38,71 +116,53 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let rest: Vec<String> = args.iter().skip(1).cloned().collect();
-    match args.first().map(String::as_str) {
-        Some("mode") => std::process::exit(mode_cmd(
-            rest.iter().find(|a| !a.starts_with("--")).map(String::as_str),
-            rest.iter().any(|a| a == "--global"),
-            rest.iter().any(|a| a == "--create"),
-        )),
-        Some("defaultmode") => std::process::exit(default_mode_cmd(
-            rest.first().map(String::as_str),
-        )),
-        Some("install") => std::process::exit(install_cmd()),
-        Some("modes") => std::process::exit(modes_cmd()),
-        Some("review") => {
-            let mode = flag_value(&rest, "--mode");
-            if rest.iter().any(|a| a == "--agent") {
-                std::process::exit(review_with_agent(mode))
+    // The hook call carries no arguments, and it is the hot path: every tool
+    // call in every session goes through it, so it never builds the parser.
+    if std::env::args().nth(1).is_none() {
+        run_hook();
+        return;
+    }
+
+    let code = match Cli::parse() {
+        Cli::Mode { name, global, create } => mode_cmd(name.as_deref(), global, create),
+        Cli::DefaultMode { name } => default_mode_cmd(Some(&name)),
+        Cli::Install => install_cmd(),
+        Cli::Modes => modes_cmd(),
+        Cli::Review { agent, mode } => {
+            if let Some(m) = mode {
+                // It used to select which mode's queue to work through. What
+                // you decide now goes to every mode that has no rule for it,
+                // so there is nothing left to select.
+                eprintln!(
+                    "the review queue is not per mode: what you decide is written into every \
+                     mode that has no rule of its own. Drop `--mode {m}`."
+                );
+                2
+            } else if agent {
+                review_with_agent()
+            } else {
+                review()
             }
-            std::process::exit(review(mode))
         }
-        Some("pending") => std::process::exit(show_pending(flag_value(&rest, "--mode"))),
-        Some("check") | Some("--check") => {
-            std::process::exit(check(&rest.first().cloned().unwrap_or_default()))
-        }
-        Some("paths") => {
+        Cli::Pending => show_pending(),
+        Cli::Check { command } => check(&command),
+        Cli::Paths => {
             println!("dir:      {}", config::dir().display());
             println!("rules:    {}", config::default_path().display());
-            println!("verdicts: {}", ledger::verdicts_path().display());
             println!("pending:  {}", ledger::pending_path().display());
             println!("state:    {}", ledger::state_path().display());
             println!("policy:   {}", agent::policy_path().display());
             println!("sessions: {}", ledger::sessions_path().display());
-            std::process::exit(0);
+            0
         }
-        Some("--help") | Some("-h") => {
-            eprintln!(
-                "askfirst: a self-evolving PreToolUse hook for Claude Code.\n\n\
-                 With no arguments it reads a hook event on stdin and writes a decision\n\
-                 on stdout. A command it has not seen asks, and joins the review queue.\n\n\
-                 askfirst mode                 print the mode in force\n\
-                 askfirst mode <name>          switch mode for this session\n\
-                 askfirst mode <name> --global switch mode for every session\n\
-                 askfirst mode <name> --create create the mode, then switch to it\n\
-                 askfirst defaultmode <name>   set the mode new sessions start in\n\
-                 askfirst install              install the /askfirst skill\n\
-                 askfirst modes                list the modes and what is waiting in each\n\
-                 askfirst review [--mode M]    categorise what is waiting\n\
-                 askfirst review --agent       let the policy judge the queue, you keep the rest\n\
-                 askfirst pending [--mode M]   list what is waiting, without deciding\n\
-                 askfirst check \"<cmd>\"        explain what would happen to one command\n\
-                 askfirst paths                print the files it uses\n\n\
-                 Everything lives in one directory; `askfirst paths` prints it.\n\
-                 ASKFIRST_HOME moves that directory, ASKFIRST_MODE overrides the mode."
-            );
-            std::process::exit(0);
+        Cli::Completions { shell } => {
+            shell.generate(&mut Cli::command(), &mut std::io::stdout());
+            0
         }
-        _ => {}
-    }
-    run_hook();
+    };
+    std::process::exit(code);
 }
 
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    let i = args.iter().position(|a| a == flag)?;
-    args.get(i + 1).cloned()
-}
 
 fn load_cfg_or_exit() -> config::Config {
     match config::load(&config::default_path()) {
@@ -158,22 +218,22 @@ fn run_hook() {
 
     ledger::record_session(&input.session_id);
     let mode = ledger::active_mode_for(&cfg, &input.session_id);
-    // A mode that is set but not defined would silently fall back to the
-    // shared rules, which is looser than the mode you thought you were in.
+    // A mode that is set but not defined has no rules at all, so every call
+    // would fall to `unseen` in a mode you thought you had written.
     if !mode.is_empty() && !cfg.knows_mode(&mode) {
         return escalate(&format!(
             "askfirst is set to mode '{mode}', which is not defined in its rules"
         ));
     }
 
-    let verdicts = ledger::load_verdicts();
-    let mut judge = |command: &str| agent::judge(&cfg.agent, &mode, command, &input.cwd);
-    let v = rules::evaluate(&cfg, &verdicts, &parsed, &input.cwd, &mode, &mut judge);
+    let mut judge =
+        |command: &str, extra: Option<&str>| agent::judge(&cfg.judge, &mode, command, &input.cwd, extra);
+    let v = rules::evaluate(&cfg, &parsed, &input.cwd, &mode, &mut judge);
 
     // Record what we had no decision for. This is an observation, never a
     // permission: only `askfirst review` writes a verdict.
     for (sig, example) in &v.unseen {
-        ledger::record_sighting(sig, example, &mode);
+        ledger::record_sighting(sig, example);
     }
 
     if let Some(out) = hook::render(v.decision, v.reason, v.context) {
@@ -191,12 +251,26 @@ fn escalate(why: &str) {
     }
 }
 
+/// Is this running inside a Claude Code session?
+///
+/// Claude Code sets CLAUDECODE in the environment of every command it runs.
+/// Outside one there is no session to report on or switch, so the session
+/// paths of `askfirst mode` say nothing rather than answering about whichever
+/// session the hook happened to serve last.
+fn in_session() -> bool {
+    std::env::var("CLAUDECODE").is_ok_and(|v| !v.trim().is_empty())
+}
+
 fn mode_cmd(name: Option<&str>, global: bool, create: bool) -> i32 {
+    // `--global` is not session-scoped, so it still works from a shell.
+    if !in_session() && !global {
+        return 0;
+    }
     let cfg = load_cfg_or_exit();
     let Some(name) = name else {
         let current = ledger::active_mode(&cfg);
         if current.is_empty() {
-            println!("no mode set; only the shared rules apply");
+            println!("no mode set; there are no rules outside a mode, so `unseen` decides everything");
         } else {
             let desc = cfg
                 .modes
@@ -262,9 +336,9 @@ fn mode_cmd(name: Option<&str>, global: bool, create: bool) -> i32 {
         println!("mode is now {name} for this session");
     }
 
-    let waiting = ledger::pending(name).len();
+    let waiting = ledger::pending(&cfg).len();
     if waiting > 0 {
-        println!("{waiting} signature(s) waiting in this mode; `askfirst review` to categorise");
+        println!("{waiting} signature(s) waiting; `askfirst review` to categorise");
     }
     0
 }
@@ -307,186 +381,163 @@ fn default_mode_cmd(name: Option<&str>) -> i32 {
 /// and so the defaults cannot drift from what the binary understands.
 const DEFAULT_RULES: &str = r##"{
   "//": "askfirst rules. Keys starting with // are comments; askfirst ignores them.",
-  "//actions": "allow | ask | deny | pass | agent. Firmness: allow < pass < agent < ask < deny.",
+  "//rules": "Every rule belongs to a mode, grouped by action there. allow and pass are lists of patterns; ask and deny map a pattern to the sentence you are shown and the model is told; agent maps a pattern to an extra prompt for the judge (empty for none).",
+  "//firmness": "When several match: allow < pass < agent < ask < deny, then the more specific pattern.",
   "//unseen": "What happens to a signature with no rule and no verdict: ask (queue it, instant), agent (judge it, 6-8s), deny, or pass.",
+  "//askfirst": "askfirst's own commands ignore unseen and ask, in every mode, unless a rule names askfirst (a catch-all match does not count). Otherwise a mode with unseen=deny would refuse `askfirst mode <name>`, the only command that leaves it, without prompting.",
   "default_mode": "contributor",
   "unseen": "ask",
-  "agent": {
-    "//": "The judge for action=agent, unseen=agent and `askfirst review --agent`.",
+  "judge": {
+    "//": "The model behind an `agent` rule, `unseen = agent` and `askfirst review --agent`.",
     "//timeout": "Keep the PreToolUse hook timeout in settings.json comfortably above this.",
     "model": "haiku",
     "timeout_secs": 20
   },
-  "//rules": "Apply in every mode. A mode may tighten these, never loosen them.",
-  "rules": [
-    {
-      "match": "* push *",
-      "action": "ask",
-      "reason": "Pushing publishes work. Confirm the remote and branch.",
-      "context": "The user requires a prompt before any push, whatever the program or alias. Wait for their answer; do not retry through a script, a wrapper or a different spelling."
-    },
-    {
-      "match": "git push --force *",
-      "action": "deny",
-      "reason": "Force push rewrites published history.",
-      "context": "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
-    },
-    {
-      "match": "git push -f *",
-      "action": "deny",
-      "reason": "Force push rewrites published history.",
-      "context": "Force push is denied. Use --force-with-lease and ask the user first, or rebase locally and push normally."
-    },
-    {
-      "match": "python3 *",
-      "action": "agent"
-    },
-    {
-      "match": "python *",
-      "action": "agent"
-    },
-    {
-      "match": "node *",
-      "action": "agent"
-    },
-    {
-      "match": "npx *",
-      "action": "agent"
-    },
-    {
-      "match": "uvx *",
-      "action": "agent"
-    }
-  ],
   "modes": {
     "reader": {
       "description": "Read and investigate. Anything that changes state is refused.",
       "unseen": "deny",
-      "rules": [
-        {
-          "match": "git status *",
-          "action": "allow"
-        },
-        {
-          "match": "git log *",
-          "action": "allow"
-        },
-        {
-          "match": "git diff *",
-          "action": "allow"
-        },
-        {
-          "match": "git show *",
-          "action": "allow"
-        },
-        {
-          "match": "git blame *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo tree *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo metadata *",
-          "action": "allow"
-        },
-        {
-          "match": "git commit *",
-          "action": "deny",
-          "reason": "reader mode does not commit.",
-          "context": "askfirst is in reader mode, which investigates without changing anything. Report what you found and let the user switch to contributor mode if they want the change made."
-        },
-        {
-          "match": "git add *",
-          "action": "deny",
-          "reason": "reader mode does not stage changes.",
-          "context": "askfirst is in reader mode. Do not stage or commit; describe the change you would make instead."
-        },
-        {
-          "match": "* push *",
-          "action": "deny",
-          "reason": "reader mode does not publish anything.",
-          "context": "askfirst is in reader mode, which never publishes. Do not push. Tell the user what you would have pushed."
-        }
-      ]
+      "allow": [
+        "git status *",
+        "git log *",
+        "git diff *",
+        "git show *",
+        "git blame *",
+        "cargo tree *",
+        "cargo metadata *",
+        "basename *",
+        "cat *",
+        "cmp *",
+        "column *",
+        "cut *",
+        "date *",
+        "df *",
+        "diff *",
+        "dirname *",
+        "du *",
+        "echo *",
+        "false *",
+        "file *",
+        "grep *",
+        "groups *",
+        "head *",
+        "hostname *",
+        "id *",
+        "jq *",
+        "less *",
+        "locale *",
+        "ls *",
+        "man *",
+        "md5 *",
+        "printf *",
+        "pwd *",
+        "realpath *",
+        "rg *",
+        "shasum *",
+        "sleep *",
+        "sort *",
+        "stat *",
+        "tail *",
+        "tput *",
+        "tr *",
+        "tree *",
+        "true *",
+        "type *",
+        "uname *",
+        "uniq *",
+        "uptime *",
+        "wc *",
+        "which *",
+        "whoami *"
+      ],
+      "deny": {
+        "git commit *": "reader mode does not commit. It investigates without changing anything: report what you found, and let the user switch to contributor mode if they want the change made.",
+        "git add *": "reader mode does not stage changes. Describe the change you would make instead.",
+        "* push *": "reader mode never publishes. Do not push; tell the user what you would have pushed."
+      }
     },
     "contributor": {
       "description": "Edit, build, test and commit. Publishing and discarding still ask.",
       "unseen": "ask",
-      "rules": [
-        {
-          "match": "cargo build *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo test *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo check *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo clippy *",
-          "action": "allow"
-        },
-        {
-          "match": "cargo fmt *",
-          "action": "allow"
-        },
-        {
-          "match": "git add *",
-          "action": "allow"
-        },
-        {
-          "match": "git commit *",
-          "action": "allow"
-        },
-        {
-          "match": "git checkout *",
-          "action": "allow"
-        },
-        {
-          "match": "git switch *",
-          "action": "allow"
-        },
-        {
-          "match": "git fetch *",
-          "action": "allow"
-        },
-        {
-          "match": "git pull *",
-          "action": "allow"
-        },
-        {
-          "match": "git reset --hard *",
-          "action": "ask",
-          "reason": "This discards uncommitted work.",
-          "context": "A hard reset throws away uncommitted changes. Confirm with the user what would be lost before running it."
-        },
-        {
-          "match": "git clean *",
-          "action": "ask",
-          "reason": "This deletes untracked files."
-        },
-        {
-          "match": "git stash *",
-          "action": "ask",
-          "reason": "Stashing can hide uncommitted work."
-        }
-      ]
+      "allow": [
+        "cargo build *",
+        "cargo test *",
+        "cargo check *",
+        "cargo clippy *",
+        "cargo fmt *",
+        "git add *",
+        "git commit *",
+        "git checkout *",
+        "git switch *",
+        "git fetch *",
+        "git pull *",
+        "basename *",
+        "cat *",
+        "cmp *",
+        "column *",
+        "cut *",
+        "date *",
+        "df *",
+        "diff *",
+        "dirname *",
+        "du *",
+        "echo *",
+        "false *",
+        "file *",
+        "grep *",
+        "groups *",
+        "head *",
+        "hostname *",
+        "id *",
+        "jq *",
+        "less *",
+        "locale *",
+        "ls *",
+        "man *",
+        "md5 *",
+        "printf *",
+        "pwd *",
+        "realpath *",
+        "rg *",
+        "shasum *",
+        "sleep *",
+        "sort *",
+        "stat *",
+        "tail *",
+        "tput *",
+        "tr *",
+        "tree *",
+        "true *",
+        "type *",
+        "uname *",
+        "uniq *",
+        "uptime *",
+        "wc *",
+        "which *",
+        "whoami *"
+      ],
+      "agent": {
+        "python3 *": "",
+        "python *": "",
+        "node *": "",
+        "npx *": "npx fetches a package from the network and runs it. Allow a pinned, well-known package that only builds or formats; anything unfamiliar or unpinned is ask.",
+        "uvx *": "uvx fetches a package from the network and runs it. Allow a pinned, well-known package that only builds or formats; anything unfamiliar or unpinned is ask."
+      },
+      "ask": {
+        "* push *": "Pushing publishes work. Confirm the remote and branch with the user, whatever the program or alias. Wait for their answer; do not retry through a script, a wrapper or a different spelling.",
+        "git reset --hard *": "This discards uncommitted work. Confirm with the user what would be lost before running it.",
+        "git clean *": "This deletes untracked files.",
+        "git stash *": "Stashing can hide uncommitted work."
+      },
+      "deny": {
+        "git push --force *": "Force push rewrites published history, so it is refused. Use --force-with-lease and ask the user first, or rebase locally and push normally.",
+        "git push -f *": "Force push rewrites published history, so it is refused. Use --force-with-lease and ask the user first, or rebase locally and push normally."
+      }
     },
     "godmode": {
-      "description": "Everything runs. Shared rules and the self-guard still apply.",
+      "description": "Everything runs. The self-guard still applies.",
       "unseen": "pass",
-      "rules": [
-        {
-          "match": "*",
-          "action": "allow"
-        }
-      ],
-      "//": "A catch-all allow. The shared rules still apply (a push still asks, a force push is still denied) and the self-guard is compiled in, so askfirst's own config still asks."
+      "//": "Its meaning is fixed in the binary: it allows everything, and this entry supplies only the description. The self-guard is compiled in, so askfirst's own config still asks."
     }
   }
 }
@@ -550,193 +601,6 @@ Deny: writing or deleting any file, staging, committing, pushing, installing
 anything, starting or stopping a service, any request that sends data rather
 than retrieving it.
 """
-"##;
-
-const SEED_VERDICTS: &str = r##"{
-  "//": "Seeded with the read-only commands Claude Code already runs without a prompt, so askfirst does not start out noisier than no hook at all. Anything that can write (sed -i, awk, find -delete, xargs, env) is left out on purpose and will come up in review.",
-  "modes": {
-    "*": {
-      "entries": {
-        "basename": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "cat": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "cmp": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "column": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "cut": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "date": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "df": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "diff": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "dirname": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "du": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "echo": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "false": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "file": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "grep": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "groups": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "head": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "hostname": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "id": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "jq": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "less": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "locale": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "ls": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "man": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "md5": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "printf": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "pwd": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "realpath": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "rg": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "shasum": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "sleep": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "sort": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "stat": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "tail": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "tput": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "tr": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "tree": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "true": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "type": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "uname": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "uniq": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "uptime": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "wc": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "which": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        },
-        "whoami": {
-          "action": "allow",
-          "decided": "2026-09-15"
-        }
-      }
-    }
-  }
-}
 "##;
 
 /// Write a file only if it is not already there. An existing rules file is
@@ -831,7 +695,6 @@ fn install_cmd() -> i32 {
     println!("Config in {}:", config::dir().display());
     write_if_absent(&config::default_path(), DEFAULT_RULES, "rules");
     write_if_absent(&agent::policy_path(), DEFAULT_POLICY, "policy");
-    write_if_absent(&ledger::verdicts_path(), SEED_VERDICTS, "verdicts");
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let skill = home.join(".claude/skills/askfirst/SKILL.md");
@@ -886,14 +749,10 @@ fn modes_cmd() -> i32 {
     if cfg.modes.is_empty() {
         println!("no modes defined in {}", config::default_path().display());
     }
-    let waiting: std::collections::BTreeMap<String, usize> =
-        ledger::pending_modes().into_iter().collect();
     for (name, def) in &cfg.modes {
         let marker = if *name == current { "*" } else { " " };
         let desc = def.description.clone().unwrap_or_default();
-        let n = waiting.get(name).copied().unwrap_or(0);
-        let tail = if n > 0 { format!("   ({n} waiting)") } else { String::new() };
-        println!("{marker} {name:<14}{desc}{tail}");
+        println!("{marker} {name:<14}{desc}");
     }
     if !cfg.modes.contains_key(config::GODMODE) {
         let marker = if current == config::GODMODE { "*" } else { " " };
@@ -902,26 +761,23 @@ fn modes_cmd() -> i32 {
             config::GODMODE
         );
     }
+    let waiting = ledger::pending(&cfg).len();
+    if waiting > 0 {
+        println!(
+            "\n{waiting} signature(s) waiting; `askfirst review` writes an answer into every mode"
+        );
+    }
     0
 }
 
-fn show_pending(mode: Option<String>) -> i32 {
+fn show_pending() -> i32 {
     let cfg = load_cfg_or_exit();
-    let mode = mode.unwrap_or_else(|| ledger::active_mode(&cfg));
-    let items = ledger::pending(&mode);
+    let items = ledger::pending(&cfg);
     if items.is_empty() {
-        println!("Nothing waiting in mode '{mode}'.");
-        let other: Vec<String> = ledger::pending_modes()
-            .into_iter()
-            .filter(|(m, n)| *m != mode && *n > 0)
-            .map(|(m, n)| format!("{m} ({n})"))
-            .collect();
-        if !other.is_empty() {
-            println!("Waiting elsewhere: {}", other.join(", "));
-        }
+        println!("Nothing waiting.");
         return 0;
     }
-    println!("{} signature(s) waiting in mode '{mode}':\n", items.len());
+    println!("{} signature(s) waiting:\n", items.len());
     for (sig, example, n) in &items {
         println!("  {sig}   (seen {n}x, e.g. {example})");
     }
@@ -932,43 +788,55 @@ fn show_pending(mode: Option<String>) -> i32 {
 /// Walk the queue and write down what you decide.
 ///
 /// This is the only thing that writes a verdict. The hook observes; you decide.
-fn review(mode: Option<String>) -> i32 {
+fn review() -> i32 {
     let cfg = load_cfg_or_exit();
-    let mode = mode.unwrap_or_else(|| ledger::active_mode(&cfg));
-    let items = ledger::pending(&mode);
+    let items = ledger::pending(&cfg);
     if items.is_empty() {
-        return show_pending(Some(mode));
+        return show_pending();
     }
 
-    let mut verdicts = ledger::load_verdicts();
+    // Every mode you have written, in the order `askfirst modes` lists them.
+    // godmode reads no rules, so there is nothing to write there.
+    let modes: Vec<String> = cfg
+        .modes
+        .keys()
+        .filter(|m| *m != config::GODMODE)
+        .cloned()
+        .collect();
+    if modes.is_empty() {
+        eprintln!(
+            "no modes defined in {}, so there is nowhere to write a decision.",
+            config::default_path().display()
+        );
+        eprintln!("Create one with `askfirst mode <name> --create`.");
+        return 2;
+    }
+
+    let mut decisions: Vec<config::Decided> = Vec::new();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let total = items.len();
-    let mut decided = 0usize;
 
     println!(
-        "{total} signature(s) to categorise in mode '{mode}'.\n\
+        "{total} signature(s) to categorise. Each answer is written into {} as a rule,\n\
+         in every mode that has no rule for it yet: {}.\n\
          a allow, s ask each time, d deny, p pass to Claude Code, j judge each time\n\
-         b broaden to the program, g apply to every mode, k skip, q quit and save\n"
+         b broaden to the program, k skip, q quit and save\n",
+        config::default_path().display(),
+        modes.join(", ")
     );
 
     for (i, (sig, example, n)) in items.iter().enumerate() {
         let mut target = sig.clone();
-        let mut scope = mode.clone();
         loop {
-            let where_ = if scope == ledger::ALL_MODES {
-                "every mode".to_string()
-            } else {
-                format!("mode {scope}")
-            };
-            println!("[{}/{total}] {target}   ({where_})", i + 1);
+            println!("[{}/{total}] {target}", i + 1);
             println!("          seen {n}x, e.g. {example}");
-            print!("          a/s/d/p/j/b/g/k/q > ");
+            print!("          a/s/d/p/j/b/k/q > ");
             let _ = std::io::stdout().flush();
 
             let Some(Ok(line)) = lines.next() else {
                 println!("\nno more input, saving what you decided");
-                return finish(&verdicts, decided);
+                return finish(&decisions);
             };
             let action = match line.trim() {
                 "a" => Action::Allow,
@@ -986,119 +854,163 @@ fn review(mode: Option<String>) -> i32 {
                     }
                     continue;
                 }
-                "g" => {
-                    scope = ledger::ALL_MODES.to_string();
-                    println!("          this decision will apply in every mode");
-                    continue;
-                }
                 "k" => break,
-                "q" => return finish(&verdicts, decided),
+                "q" => return finish(&decisions),
                 other => {
-                    println!("          '{other}'? use a, s, d, p, j, b, g, k or q");
+                    println!("          '{other}'? use a, s, d, p, j, b, k or q");
                     continue;
                 }
             };
-            verdicts.set(
-                &scope,
-                &target,
-                ledger::Entry { action, note: None, decided: Some(today()) },
-            );
-            decided += 1;
-            println!("          {target} -> {} ({where_})\n", action.label());
+            // A signature is not a pattern: `cargo test` has to become
+            // `cargo test *` to cover the arguments that follow it.
+            let pattern = format!("{target} *");
+            let mut written: Vec<&str> = Vec::new();
+            for m in &modes {
+                if cfg.covers(m, &target) {
+                    continue; // this mode already answers for it
+                }
+                decisions.push(config::Decided {
+                    mode: m.clone(),
+                    action,
+                    pattern: pattern.clone(),
+                    note: None,
+                });
+                written.push(m);
+            }
+            if written.is_empty() {
+                println!("          every mode already decides {target}\n");
+            } else {
+                println!(
+                    "          {pattern} -> {} in {}\n",
+                    action.label(),
+                    written.join(", ")
+                );
+            }
             break;
         }
     }
-    finish(&verdicts, decided)
+    finish(&decisions)
 }
 
-/// Resolve the queue with the same judge the `agent` unseen mode uses.
+/// Resolve the queue with the judge, against every mode's policy at once.
 ///
 /// Only a confident `allow` or `deny` is written. Anything the policy does not
 /// settle, and anything that fails, stays in the queue and is listed at the
 /// end, because the point of the queue is that you decide what the policy did
 /// not. This writes verdicts from a model's answers, which the hook itself
 /// never does: it is one deliberate command, not something a session can do.
-fn review_with_agent(mode: Option<String>) -> i32 {
+fn review_with_agent() -> i32 {
     let cfg = load_cfg_or_exit();
-    let mode = mode.unwrap_or_else(|| ledger::active_mode(&cfg));
-    let items = ledger::pending(&mode);
+    let items = ledger::pending(&cfg);
     if items.is_empty() {
-        return show_pending(Some(mode));
+        return show_pending();
     }
 
-    // Fail before spending anything if the policy cannot answer for this mode.
-    match agent::load_policy() {
-        Ok(p) => {
-            if agent::policy_for(&p, &mode).is_none() {
-                eprintln!(
-                    "{} has no entry for mode '{mode}', so the judge has nothing to judge against.",
-                    agent::policy_path().display()
-                );
-                return 2;
-            }
-        }
+    // One pass per mode, against that mode's own policy. The modes are the
+    // point: `reader` and `contributor` should not be given the same answer
+    // about `cargo build`, and a judge asked for one answer covering both can
+    // only give the stricter one. godmode reads no rules, so it is skipped,
+    // and a mode with no policy entry has nothing to judge against.
+    let policy = match agent::load_policy() {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
             return 2;
         }
+    };
+    let modes: Vec<String> = cfg
+        .modes
+        .keys()
+        .filter(|m| *m != config::GODMODE)
+        .filter(|m| agent::policy_for(&policy, m).is_some())
+        .cloned()
+        .collect();
+    if modes.is_empty() {
+        eprintln!(
+            "{} has no entry for any mode in {}, so the judge has nothing to judge against.",
+            agent::policy_path().display(),
+            config::default_path().display()
+        );
+        return 2;
     }
 
     println!(
-        "Judging {} signature(s) in mode '{mode}' against {} using {}.\n",
+        "Judging {} signature(s) in {} mode(s) ({}) against {}, using {}.\n",
         items.len(),
+        modes.len(),
+        modes.join(", "),
         agent::policy_path().display(),
-        cfg.agent.model
+        cfg.judge.model
     );
 
-    let mut verdicts = ledger::load_verdicts();
-    let mut decided = 0usize;
+    let mut decisions: Vec<config::Decided> = Vec::new();
     let mut left: Vec<(String, String)> = Vec::new();
 
     for (sig, example, n) in &items {
-        let (d, why) = agent::judge(&cfg.agent, &mode, example, "");
-        let action = match d {
-            Decision::Allow => Some(Action::Allow),
-            Decision::Deny => Some(Action::Deny),
-            // Ask is the judge declining to decide, which is the answer it is
-            // told to give when unsure. Leave it for a person.
-            _ => None,
-        };
-        match action {
-            Some(a) => {
-                verdicts.set(
-                    &mode,
-                    sig,
-                    ledger::Entry {
+        let pattern = format!("{sig} *");
+        let mut answers: Vec<String> = Vec::new();
+        let mut undecided: Vec<String> = Vec::new();
+        for m in &modes {
+            if cfg.covers(m, sig) {
+                answers.push(format!("{m}: already decided"));
+                continue;
+            }
+            let (d, why) = agent::judge(&cfg.judge, m, example, "", None);
+            let action = match d {
+                Decision::Allow => Some(Action::Allow),
+                Decision::Deny => Some(Action::Deny),
+                // Ask is the judge declining to decide, which is the answer it
+                // is told to give when unsure. Leave it for a person.
+                _ => None,
+            };
+            match action {
+                Some(a) => {
+                    decisions.push(config::Decided {
+                        mode: m.clone(),
                         action: a,
-                        note: why.clone(),
-                        decided: Some(today()),
-                    },
-                );
-                decided += 1;
-                println!("  {:<28} {}", sig, a.label());
+                        pattern: pattern.clone(),
+                        note: Some(format!(
+                            "{m} policy, judged by `askfirst review --agent` on {}",
+                            today()
+                        )),
+                    });
+                    answers.push(format!("{m}: {}", a.label()));
+                }
+                None => {
+                    answers.push(format!(
+                        "{m}: left ({})",
+                        why.unwrap_or_else(|| "not settled by the policy".into())
+                    ));
+                    undecided.push(m.clone());
+                }
             }
-            None => {
-                let reason = why.unwrap_or_else(|| "not settled by the policy".into());
-                println!("  {:<28} left  ({reason})", sig);
-                left.push((sig.clone(), format!("seen {n}x, e.g. {example}")));
-            }
+        }
+        println!("  {:<28} {}", sig, answers.join(", "));
+        if !undecided.is_empty() {
+            left.push((
+                sig.clone(),
+                format!("seen {n}x in {}, e.g. {example}", undecided.join(", ")),
+            ));
         }
     }
 
-    if let Err(e) = ledger::save_verdicts(&verdicts) {
-        eprintln!("could not write verdicts: {e}");
+    let wrote = decisions.len();
+    if let Err(e) = config::add_rules(&decisions) {
+        eprintln!("could not write the rules: {e}");
         return 1;
     }
-    if let Err(e) = ledger::prune_pending() {
+    let cfg = config::load(&config::default_path()).unwrap_or(cfg);
+    if let Err(e) = ledger::prune_pending(&cfg) {
         eprintln!("could not prune the queue: {e}");
     }
 
     println!(
-        "\n{decided} decided by the policy, {} left for you.",
+        "\n{wrote} rule(s) written to {}, {} signature(s) left for you.",
+        config::default_path().display(),
         left.len()
     );
     if !left.is_empty() {
-        println!("\nStill waiting in mode '{mode}':");
+        println!("\nStill waiting:");
         for (sig, detail) in &left {
             println!("  {sig}   ({detail})");
         }
@@ -1107,17 +1019,23 @@ fn review_with_agent(mode: Option<String>) -> i32 {
     0
 }
 
-fn finish(verdicts: &ledger::Verdicts, decided: usize) -> i32 {
-    if let Err(e) = ledger::save_verdicts(verdicts) {
-        eprintln!("could not write verdicts: {e}");
+fn finish(decisions: &[config::Decided]) -> i32 {
+    if decisions.is_empty() {
+        println!("nothing decided, nothing written");
+        return 0;
+    }
+    if let Err(e) = config::add_rules(decisions) {
+        eprintln!("could not write the rules: {e}");
         return 1;
     }
-    if let Err(e) = ledger::prune_pending() {
+    let cfg = config::load(&config::default_path()).unwrap_or_default();
+    if let Err(e) = ledger::prune_pending(&cfg) {
         eprintln!("could not prune the queue: {e}");
     }
     println!(
-        "{decided} decision(s) written to {}",
-        ledger::verdicts_path().display()
+        "{} rule(s) written to {}",
+        decisions.len(),
+        config::default_path().display()
     );
     0
 }
@@ -1153,9 +1071,9 @@ fn check(command: &str) -> i32 {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let verdicts = ledger::load_verdicts();
-    let mut judge = |command: &str| agent::judge(&cfg.agent, &mode, command, &cwd);
-    let v = rules::evaluate(&cfg, &verdicts, &parsed, &cwd, &mode, &mut judge);
+    let mut judge =
+        |command: &str, extra: Option<&str>| agent::judge(&cfg.judge, &mode, command, &cwd, extra);
+    let v = rules::evaluate(&cfg, &parsed, &cwd, &mode, &mut judge);
     println!(
         "verdict: {}",
         match v.decision {

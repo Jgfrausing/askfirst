@@ -42,7 +42,7 @@ cp target/release/askfirst ~/.local/bin/
 askfirst install
 ```
 
-`install` writes the default config, a starter policy, a seed of read-only verdicts and the
+`install` writes the default config, a starter policy and the
 `/askfirst` skill. It never overwrites a file that already exists. It then prints the hook
 registration to add to `~/.claude/settings.json`:
 
@@ -61,21 +61,25 @@ registration to add to `~/.claude/settings.json`:
 }
 ```
 
-The timeout must exceed `agent.timeout_secs`, or a judged call is killed mid-answer and the
+The timeout must exceed `judge.timeout_secs`, or a judged call is killed mid-answer and the
 tool call proceeds ungated.
+
+`askfirst --help` lists the rest, and `askfirst completions <shell>` prints a completion script.
+With no arguments at all it is the hook, reading an event on stdin.
 
 ## How a call is decided
 
 Per sub-command, in order:
 
-1. A rule you wrote in `rules.json`. Shared rules plus the active mode's.
-2. A verdict you gave during review, for the signature or for the program as a whole.
-3. Never seen: whatever the mode's `unseen` says.
+1. A rule in `rules.json`, in the mode you are in. What you decided during review is one of
+   these: review writes its answers into the same file, in the same groups.
+2. Never seen: whatever the mode's `unseen` says, except for askfirst's own commands, which
+   ask.
 
 The strictest outcome across every sub-command wins, so one unseen segment in
 `ls && mystery-tool` stops the whole thing.
 
-Only `askfirst review` writes a verdict. The hook appends observations and nothing else, so a
+Only `askfirst review` writes a rule. The hook appends observations and nothing else, so a
 session cannot widen its own permissions by running a command: running it is exactly what puts
 it in the queue.
 
@@ -89,23 +93,56 @@ it in the queue.
 | `pass` | say nothing and let Claude Code's own flow decide |
 | `agent` | hand the whole command to a model, which answers allow/ask/deny against your policy |
 
-Firmness, when several rules match: `allow < pass < agent < ask < deny`.
+Firmness, when several rules match: `allow < pass < agent < ask < deny`. Between two equally
+firm matches, the more specific pattern is the one quoted back to you.
 
-`agent` is for commands whose signature cannot tell you enough. `python3` says nothing about
-what the script does, and `docker run` nothing about the image:
+## Writing rules
+
+Every rule belongs to a mode, grouped there by what it does:
 
 ```json
-{ "match": "python3 *", "action": "agent" }
+{
+  "modes": {
+    "contributor": {
+      "unseen": "ask",
+      "allow": ["cargo test *", "git status *"],
+      "pass": ["ls *"],
+      "ask": { "* push *": "Pushing publishes work. Confirm the remote and branch." },
+      "deny": { "git push --force *": "Force push rewrites published history. Use --force-with-lease." },
+      "agent": { "npx *": "npx runs a package off the network. Anything unpinned is ask." }
+    }
+  }
+}
 ```
 
-Real verdicts from that one rule: `python3 -m json.tool data.json` allow,
+Nothing sits above the modes. A boundary you want everywhere is written into each mode that
+should have it, which is a line repeated rather than a tier to reason about: the mode you are
+in is the whole answer, and reading one mode tells you everything that mode does.
+
+`allow` and `pass` are lists of patterns, because neither needs anything said about it. `ask`
+and `deny` map a pattern to one sentence: it is what you are shown when the call stops, and
+what the model is told about it. There is one string rather than a short reason and a longer
+context, which said the same thing twice.
+
+A pattern is matched word by word against the command. `*` matches one word, and a trailing
+`*` matches any remaining words, so `git push *` covers a bare `git push`.
+
+`agent` is for commands whose signature cannot tell you enough. `python3` says nothing about
+what the script does, and `docker run` nothing about the image. Its value is an extra line of
+policy for the judge, about that pattern alone, on top of the mode's entry in `policy.toml`.
+Leave it empty for none:
+
+```json
+"agent": { "python3 *": "" }
+```
+
+Real answers from that one rule: `python3 -m json.tool data.json` allow,
 `python3 deploy_to_prod.py --yes` deny.
 
 ## Modes
 
-A mode is the posture you are working in. Rules written at the top level apply in every mode;
-a mode's own rules are added to them, so a mode can tighten a shared rule but never loosen one.
-Each mode sets its own `unseen`.
+A mode is the posture you are working in. It holds its own rules and its own `unseen`, and
+they are all that applies while it is active.
 
 ```
 $ askfirst modes
@@ -118,13 +155,18 @@ $ askfirst modes
 `ASKFIRST_MODE` for one invocation. `askfirst defaultmode <name>` sets what new sessions start
 in, and fails if the mode does not exist.
 
-Verdicts are scoped to the mode you gave them in, so what you allow while contributing does not
-follow you into a read-only session. During review, `g` records a decision for every mode.
+One queue, one pass. A signature waits once, whatever mode it came up in, and stays there
+until every mode has an answer for it. `askfirst review` asks you once and writes the answer
+into each mode that has none; `askfirst review --agent` asks each mode's policy separately, so
+`reader` and `contributor` can come back with different answers for the same command. A mode
+that already decides a signature is left alone either way.
 
 `godmode` is decided in the binary rather than the config: it allows everything, overriding
-every rule, verdict and `unseen` setting, and no rules file can redefine or remove it. It is
+every rule and `unseen` setting, and no rules file can redefine or remove it. It is
 always available as a way out of a config that has locked itself up. Its one exception is
 below.
+
+A mode you have not defined has no rules, so `unseen` decides every call in it.
 
 ## Signatures
 
@@ -147,39 +189,45 @@ become its own entry. During review, `b` broadens a signature to the program alo
 
 ```
 $ askfirst pending
-6 signature(s) waiting in mode 'contributor':
+6 signature(s) waiting:
 
   cargo build   (seen 2x, e.g. cargo build --release)
   git publish   (seen 1x, e.g. git publish)
 
 $ askfirst review
+6 signature(s) to categorise. Each answer is written into ~/.config/askfirst/rules.json
+as a rule, in every mode that has no rule for it yet: contributor, reader.
+
 [1/6] cargo build
           seen 2x, e.g. cargo build --release
-          a/s/d/p/j/b/g/k/q > a
-          cargo build -> allow
+          a/s/d/p/j/b/k/q > a
+          cargo build * -> allow in contributor, reader
 ```
 
 `a` allow, `s` ask every time, `d` deny, `p` pass, `j` judge every time, `b` broaden to the
-program, `g` apply to every mode, `k` skip, `q` quit and save.
+program, `k` skip, `q` quit and save.
 
-`askfirst review --agent` resolves the queue with your policy instead, recording only a
-confident allow or deny and leaving everything else for you:
+`askfirst review --agent` resolves the queue with your policy instead, one question per mode
+per signature, writing only a confident allow or deny. Anything a policy does not settle stays
+in the queue for you:
 
 ```
 $ askfirst review --agent
-  curl                         deny
-  rg src                       allow
-  some-weird-tool              left  (the contributor policy judged this 'ask')
+  curl                         reader: deny, contributor: deny
+  rg                           reader: allow, contributor: allow
+  cargo build                  reader: deny, contributor: allow
+  some-weird-tool              reader: left (not settled by the policy), contributor: left
 
-2 decided by the policy, 1 left for you.
+6 rule(s) written to ~/.config/askfirst/rules.json, 1 signature(s) left for you.
 ```
 
-That writes verdicts from a model's answers, which the hook itself never does. It is safe only
+That writes rules from a model's answers, which the hook itself never does. It is safe only
 because it is one deliberate command you run, not something a session can reach.
 
 ## The policy
 
-`policy.toml` is the prompt the `agent` action and `review --agent` judge against. One entry
+`policy.toml` is the prompt the `agent` action and `review --agent` judge against, plus
+whatever line the matching `agent` rule carries. One entry
 per mode, in plain English, plus a `shared` block prepended to all of them. It stays TOML while
 everything else is JSON because it is the one file that is mostly prose, and TOML has a
 multi-line string.
@@ -202,8 +250,9 @@ vague one is not. Every failure is `ask` too: no policy file, no entry for the m
 a non-zero exit, a hedged answer, a recursive call.
 
 The judge defaults to `claude -p --model haiku` using your existing login, with hooks disabled,
-MCP loading skipped and all tools disallowed. Set `agent.model` to change it, or
-`agent.command` and `agent.args` for a judge that is not the Claude CLI. A judged call costs
+MCP loading skipped and all tools disallowed. Set `judge.model` to change it, or
+`judge.command` and `judge.args` for a judge that is not the Claude CLI. The block is called
+`judge` because `agent` is the name of an action. A judged call costs
 6 to 8 seconds, which is why `unseen = "agent"` is a poor fit for interactive work and
 `review --agent` is the better use of it.
 
@@ -217,12 +266,26 @@ touches:
 - its own binary
 - `~/.claude/settings.json` and `settings.local.json`, where the hook is registered and where
   an `env` block could redirect `ASKFIRST_HOME`
-- any invocation of askfirst itself, except `askfirst check`
+- any invocation of askfirst itself, except `askfirst check`, unless you wrote a rule naming
+  that command
 
 This holds through a shell (`sed -i`, a `>` redirect, `mv`, `rm`, `tee`), through the file
 tools (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`), through wrappers (`sudo`, `env`,
 `bash -c`), and in `godmode`. That last exception is what keeps godmode reversible: entering it
 costs one approval, and if it also bypassed this, that single approval could be made permanent.
+
+Running askfirst is the one part of this a rule can decide, and the rule has to name askfirst:
+
+```json
+"modes": { "reader": { "allow": ["askfirst mode *"] } }
+```
+
+A catch-all such as `"allow": ["*"]` is written about other commands and does not decide this
+one. With no such rule, running askfirst asks, whatever the mode's
+`unseen` says. That is what lets a session ask to leave a mode it cannot work in: `reader` sets
+`unseen = "deny"`, and taking that answer would refuse `askfirst mode contributor`, the only
+command that leaves `reader`, without ever offering you the prompt. A mode's `unseen` never
+decides the command that leaves it.
 
 Naming a file is not the same as writing to it, and telling them apart needs the semantics of
 every program, so this errs toward asking.
@@ -231,9 +294,8 @@ every program, so this errs toward asking.
 
 | Path | Written by | Holds |
 |---|---|---|
-| `~/.config/askfirst/rules.json` | you | rules, modes, judge config |
+| `~/.config/askfirst/rules.json` | you, and `askfirst review` | rules, modes, judge config |
 | `~/.config/askfirst/policy.toml` | you | the prose the judge reads |
-| `~/.config/askfirst/verdicts.json` | `askfirst review` | what you decided, per mode |
 | `~/.config/askfirst/pending.jsonl` | the hook | signatures seen with no decision yet |
 | `~/.config/askfirst/state.json` | askfirst | global mode, current session |
 | `~/.config/askfirst/sessions.json` | askfirst | per-session modes |
@@ -262,7 +324,7 @@ About 2.7 ms per call including process spawn, when no judge is involved.
 
 Bash and the file tools only. Every other tool passes through untouched.
 
-Signatures ignore arguments. A verdict on `rm` covers `rm -rf /` as well as `rm foo`. Where the
+Signatures ignore arguments. A rule on `rm *` covers `rm -rf /` as well as `rm foo`. Where the
 arguments are the danger, write a rule or use `action = "agent"`.
 
 It cannot see inside a script. `bash deploy.sh` is judged on the name `bash`; what the file

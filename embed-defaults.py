@@ -19,26 +19,42 @@ root = Path(__file__).parent
 
 def build_rules_json() -> str:
     d = tomllib.load((root / "rules.default.toml").open("rb"))
+
+    def groups(src: dict) -> dict:
+        """The five action groups, in firmness order, skipping the empty ones."""
+        out = {}
+        for k in ("allow", "pass", "agent", "ask", "deny"):
+            v = src.get(k)
+            if v:
+                out[k] = v
+        return out
+
     out = {
         "//": "askfirst rules. Keys starting with // are comments; askfirst ignores them.",
-        "//actions": "allow | ask | deny | pass | agent. Firmness: allow < pass < agent < ask < deny.",
+        "//rules": "Every rule belongs to a mode, grouped by action there. allow and pass are lists of patterns; ask and deny map a pattern to the sentence you are shown and the model is told; agent maps a pattern to an extra prompt for the judge (empty for none).",
+        "//firmness": "When several match: allow < pass < agent < ask < deny, then the more specific pattern.",
         "//unseen": "What happens to a signature with no rule and no verdict: ask (queue it, instant), agent (judge it, 6-8s), deny, or pass.",
+        "//askfirst": "askfirst's own commands ignore unseen and ask, in every mode, unless a rule names askfirst (a catch-all match does not count). Otherwise a mode with unseen=deny would refuse `askfirst mode <name>`, the only command that leaves it, without prompting.",
         "default_mode": d["default_mode"],
         "unseen": d["unseen"],
-        "agent": {
-            "//": "The judge for action=agent, unseen=agent and `askfirst review --agent`.",
+        "judge": {
+            "//": "The model behind an `agent` rule, `unseen = agent` and `askfirst review --agent`.",
             "//timeout": "Keep the PreToolUse hook timeout in settings.json comfortably above this.",
-            **d["agent"],
+            **d["judge"],
         },
-        "//rules": "Apply in every mode. A mode may tighten these, never loosen them.",
-        "rules": d["rules"],
-        "modes": {name: dict(m) for name, m in d["modes"].items()},
+        "modes": {
+            name: {
+                **{k: v for k, v in m.items() if k in ("description", "unseen")},
+                **groups(m),
+            }
+            for name, m in d["modes"].items()
+        },
     }
     if "godmode" in out["modes"]:
         out["modes"]["godmode"]["//"] = (
-            "A catch-all allow. The shared rules still apply (a push still asks, a force "
-            "push is still denied) and the self-guard is compiled in, so askfirst's own "
-            "config still asks."
+            "Its meaning is fixed in the binary: it allows everything, and this entry "
+            "supplies only the description. The self-guard is compiled in, so askfirst's "
+            "own config still asks."
         )
     return json.dumps(out, indent=2) + "\n"
 
@@ -59,14 +75,16 @@ rules = build_rules_json()
 (root / "rules.default.json").write_text(rules)
 
 policy = (root / "policy.example.toml").read_text()
-verdicts = (root / "verdicts.seed.json").read_text()
 
 main = (root / "src" / "main.rs").read_text()
 main = replace_const(main, "DEFAULT_RULES", rules)
 main = replace_const(main, "DEFAULT_POLICY", policy)
-main = replace_const(main, "SEED_VERDICTS", verdicts)
 (root / "src" / "main.rs").write_text(main)
 
 d = json.loads(rules)
-print(f"embedded: {len(d['rules'])} shared rules, modes {list(d['modes'])}")
-print(f"          policy {len(policy)} bytes, seed {len(json.loads(verdicts)['modes']['*']['entries'])} verdicts")
+counts = {
+    name: sum(len(m.get(k, [])) for k in ("allow", "pass", "agent", "ask", "deny"))
+    for name, m in d["modes"].items()
+}
+print(f"embedded: rules per mode {counts}")
+print(f"          policy {len(policy)} bytes")

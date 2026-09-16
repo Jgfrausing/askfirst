@@ -1,12 +1,13 @@
 //! Decide one tool call.
 //!
-//! Order per sub-command: a hand-written rule, then a verdict you gave during
-//! review, then unseen. Strictest wins across every sub-command, so one
-//! asked segment makes the whole compound command ask.
+//! Order per sub-command: a rule in the active mode, then unseen. What you
+//! decided during review is a rule like any other, in the mode you decided it
+//! for, so there is one place to look. Strictest wins across every
+//! sub-command, so one asked segment makes the whole compound command ask.
 
 use crate::config::{Config, Rule};
 use crate::hook::Decision;
-use crate::ledger::{self, Verdicts};
+use crate::ledger;
 
 /// Global flags that sit between a program and its subcommand. Skipping them
 /// is what makes one `git push` signature cover `git -C . push` and
@@ -23,6 +24,10 @@ const SUBCOMMAND_SKIP: &[(&str, &[&str])] = &[
 const WRAPPERS: &[&str] =
     &["sudo", "doas", "env", "nohup", "time", "timeout", "nice", "xargs", "command"];
 
+/// What askfirst asks the judge: a command, and the rule's own prompt when it
+/// carries one. It answers a decision and a line about why.
+pub type Judge<'a> = &'a mut dyn FnMut(&str, Option<&str>) -> (Decision, Option<String>);
+
 pub struct Verdict {
     pub decision: Decision,
     pub reason: Option<String>,
@@ -31,16 +36,17 @@ pub struct Verdict {
     pub unseen: Vec<(String, String)>,
 }
 
-/// Decide a call. `judge` is consulted only for a signature with no rule and
-/// no verdict when the mode's `unseen` is `agent`; it is injected so the
-/// decision logic stays testable without spawning anything.
+/// Decide a call. `judge` is consulted for an `agent` rule and for a
+/// signature with no rule and no verdict when the mode's `unseen` is `agent`.
+/// Its second argument is the rule's own extra prompt, if it carries one. It
+/// is injected so the decision logic stays testable without spawning
+/// anything.
 pub fn evaluate(
     cfg: &Config,
-    verdicts: &Verdicts,
     parsed: &crate::parse::Parsed,
     cwd: &str,
     mode: &str,
-    judge: &mut dyn FnMut(&str) -> (Decision, Option<String>),
+    judge: Judge,
 ) -> Verdict {
     let commands = &parsed.commands;
     let mut best: Option<(Decision, Option<String>, Option<String>)> = None;
@@ -55,26 +61,21 @@ pub fn evaluate(
         named.extend(c.argv.iter().cloned());
     }
     let path_touch = crate::selfguard::touches_self(&named, cwd, &protected);
-    let mut self_touch = path_touch.clone();
-    // A call to askfirst itself carries no path, so the check above misses it.
-    // `askfirst review` is what writes verdicts: an agent that can run it can
-    // approve its own queue.
-    // Normalised, so `sudo askfirst review` and `/usr/bin/askfirst review`
-    // are caught as readily as the bare spelling.
-    let self_invoke = commands
-        .iter()
-        .find_map(|c| crate::selfguard::invokes_self(&normalise(&c.argv)));
-    if self_touch.is_none() {
-        self_touch = self_invoke.clone();
-    }
 
     // godmode is decided here, not by the rules, so no rules file can take it
     // away and none can water it down. The self-guard below still applies: it
     // is what keeps godmode reversible, since a session that could rewrite the
     // rules file could make godmode permanent from a single approval.
     if mode == crate::config::GODMODE {
+        // A call to askfirst itself carries no path, so the path check misses
+        // it. Normalised, so `sudo askfirst review` and `/usr/bin/askfirst
+        // review` are caught as readily as the bare spelling. Every other mode
+        // handles this per sub-command, in the loop below.
+        let self_invoke = commands
+            .iter()
+            .find_map(|c| crate::selfguard::invokes_self(&normalise(&c.argv)));
         let (mut decision, mut reason, mut context) = (Decision::Allow, None, None);
-        if let Some(word) = self_touch {
+        if let Some(word) = path_touch.clone().or(self_invoke) {
             decision = Decision::Ask;
             reason = Some(format!(
                 "godmode allows everything except askfirst's own configuration ('{word}')"
@@ -102,45 +103,67 @@ pub fn evaluate(
         let sig = ledger::signature(&argv);
         let example = cmd.argv.join(" ");
 
-        // 1. A rule you wrote wins outright: the shared ones plus this
-        //    mode's own.
-        if let Some(rule) = first_match(&in_force, &argv) {
-            if rule.action == crate::config::Action::Agent {
-                let (d, why) = judge(&example);
-                let why = why.unwrap_or_else(|| "judged against your policy".into());
-                consider(
-                    d,
-                    Some(rule.reason.clone().unwrap_or_else(|| format!("'{sig}' is always judged: {why}"))),
-                    Some(judged_context(&sig, mode, &why, rule.context.as_deref())),
-                );
-            } else {
-                consider(rule.action.into(), rule.reason.clone(), rule.context.clone());
-            }
-            continue;
-        }
+        // Running askfirst is decided by a rule or a verdict that names it,
+        // and asks when neither does. The `unseen` step below says why.
+        let self_call = crate::selfguard::invokes_self(&argv).is_some();
 
-        // 2. A verdict you gave during review, in this mode or for all modes.
-        if let Some(e) = verdicts.lookup(mode, &sig) {
-            if e.action == crate::config::Action::Agent {
-                let (d, why) = judge(&example);
+        // 1. A rule in this mode wins outright. A rule about
+        //    askfirst has to name askfirst, so that a catch-all written about
+        //    other commands cannot open the gate.
+        let rule = if self_call {
+            first_match(
+                in_force.iter().filter(|r| crate::selfguard::pattern_names_self(&r.pattern)),
+                &argv,
+            )
+        } else {
+            first_match(&in_force, &argv)
+        };
+        if let Some(rule) = rule {
+            if rule.action == crate::config::Action::Agent {
+                let (d, why) = judge(&example, rule.prompt.as_deref());
                 let why = why.unwrap_or_else(|| "judged against your policy".into());
                 consider(
                     d,
                     Some(format!("'{sig}' is always judged: {why}")),
-                    Some(judged_context(&sig, mode, &why, None)),
+                    Some(judged_context(&sig, mode, &why, rule.prompt.as_deref())),
                 );
             } else {
-                let note = e.note.clone();
-                consider(e.action.into(), note.clone(), note);
+                // One string does both jobs: it is what you are shown when the
+                // call stops and what the model is told about it.
+                consider(rule.action.into(), rule.context.clone(), rule.context.clone());
             }
             continue;
         }
 
-        // 3. Never seen. Queue it either way, then decide how to handle it
-        //    now: the mode's fixed answer, or the judge.
+        // 2. Never seen. askfirst's own commands do not take the mode's
+        //    answer for an uncategorised command: they ask. `askfirst mode`
+        //    is the only way out of a mode, so a mode whose `unseen` is deny
+        //    would swallow it with no prompt to approve (reader did exactly
+        //    that), and one whose `unseen` is pass or allow would let a
+        //    session change the gate without you seeing it. They are not
+        //    queued either: a verdict earned by running askfirst would be
+        //    self-granting.
+        if self_call {
+            consider(
+                Decision::Ask,
+                Some(format!("'{sig}' runs askfirst itself")),
+                Some(
+                    "This command runs askfirst itself, which asks unless the user has written a rule naming that command: \
+                     `askfirst review` records permissions and `askfirst mode` changes what runs without asking. \
+                     `askfirst check \"<command>\"` is the exception, reporting what would happen and changing nothing, \
+                     so use that if you want to know where a boundary is. \
+                     Wait for the user; do not rewrite the invocation to avoid this check."
+                        .to_string(),
+                ),
+            );
+            continue;
+        }
+
+        // Anything else is queued either way, then handled now: the mode's
+        // fixed answer, or the judge.
         unseen.push((sig.clone(), example.clone()));
         if cfg.unseen_for(mode) == crate::config::Unseen::Agent {
-            let (d, why) = judge(&example);
+            let (d, why) = judge(&example, None);
             let why = why.unwrap_or_else(|| "judged against your policy".into());
             consider(
                 d,
@@ -165,29 +188,20 @@ pub fn evaluate(
 
     let (mut decision, mut reason, mut context) = best.unwrap_or((Decision::Pass, None, None));
 
-    if let Some(word) = self_touch {
-        // Deny is stricter than ask, so a deny rule still wins. Anything
-        // softer is raised to a prompt.
+    if let Some(word) = path_touch {
+        // An explicit deny on askfirst's files is a boundary worth keeping,
+        // so this only raises a softer decision to a prompt.
         decision = decision.max(Decision::Ask);
-        // The explanation is always the self-guard's, even when something
-        // else set the decision: being told the call was uncategorised, when
-        // it was actually refused for touching the gate, teaches the agent
-        // the wrong lesson and invites a retry under another name.
-        {
-            if path_touch.is_none() && self_invoke.is_some() {
-                reason = Some(format!("this command runs askfirst itself ('{word}')"));
-                context = Some(format!(
-                    "This command runs askfirst itself ('{word}'). `askfirst review` is what records permissions, so running it would let this session approve its own queue. Every askfirst subcommand asks except `askfirst check \"<command>\"`, which reports what would happen and changes nothing: use that if you want to know where a boundary is. Wait for the user; do not rewrite the invocation to avoid this check."
-                ));
-            } else {
-                reason = Some(format!(
-                    "this command names askfirst's own configuration ('{word}')"
-                ));
-                context = Some(format!(
-                    "This command names askfirst's own configuration or binary ('{word}'). askfirst always asks before its own rules, verdicts or executable are touched, so that the gate cannot be widened without the user seeing it. Wait for the user; do not rewrite the path to avoid this check."
-                ));
-            }
-        }
+        // The explanation is the self-guard's, even when something else set
+        // the decision: being told the call was uncategorised, when it was
+        // actually stopped for touching the gate, teaches the agent the wrong
+        // lesson and invites a retry under another name.
+        reason = Some(format!(
+            "this command names askfirst's own configuration ('{word}')"
+        ));
+        context = Some(format!(
+            "This command names askfirst's own configuration or binary ('{word}'). askfirst always asks before its own rules, verdicts or executable are touched, so that the gate cannot be widened without the user seeing it. Wait for the user; do not rewrite the path to avoid this check."
+        ));
         // Never queue a signature learned from a call that edits the gate: a
         // verdict earned this way would be self-granting.
         unseen.clear();
@@ -196,7 +210,8 @@ pub fn evaluate(
     Verdict { decision, reason, context, unseen }
 }
 
-/// What the model is told when a rule or verdict routed this call to it.
+/// What the model is told when a rule or verdict routed this call to the
+/// judge. `extra` is the rule's own prompt, which the judge saw too.
 fn judged_context(sig: &str, mode: &str, why: &str, extra: Option<&str>) -> String {
     let mut s = format!(
         "'{sig}' is always judged rather than decided by its name alone, because the name does not say what it will do.          askfirst judged this call against the '{mode}' policy: {why}.          The verdict applies to this call only and is not recorded.          Do not rephrase the command to get a different signature."
@@ -208,12 +223,22 @@ fn judged_context(sig: &str, mode: &str, why: &str, extra: Option<&str>) -> Stri
     s
 }
 
-fn first_match<'a>(rules: &[&'a Rule], argv: &[String]) -> Option<&'a Rule> {
+/// The rule that decides a command: the firmest that matches, and among
+/// equally firm ones the most specific, so `git push --force *` explains
+/// itself rather than whichever equally firm rule was read first.
+fn first_match<'a>(
+    rules: impl IntoIterator<Item = &'a Rule>,
+    argv: &[String],
+) -> Option<&'a Rule> {
     let mut chosen: Option<&Rule> = None;
-    for rule in rules.iter().copied() {
-        if matches(&rule.pattern, argv)
-            && chosen.is_none_or(|c| rule.action.rank() > c.action.rank())
-        {
+    for rule in rules {
+        if !matches(&rule.pattern, argv) {
+            continue;
+        }
+        let better = chosen.is_none_or(|c| {
+            (rule.action.rank(), rule.pattern.len()) > (c.action.rank(), c.pattern.len())
+        });
+        if better {
             chosen = Some(rule);
         }
     }
@@ -280,7 +305,7 @@ fn base_name(s: &str) -> String {
 /// `*` matches exactly one word. A trailing `*` matches any remaining words,
 /// including none, so `git push *` covers a bare `git push`, and `* push *`
 /// covers a push by whatever program.
-fn matches(pattern: &str, argv: &[String]) -> bool {
+pub fn matches(pattern: &str, argv: &[String]) -> bool {
     let pat: Vec<&str> = pattern.split_whitespace().collect();
     if pat.is_empty() {
         return false;
@@ -304,49 +329,45 @@ fn matches(pattern: &str, argv: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Action, Unseen};
-    use crate::ledger::Entry;
 
+    /// A config whose one mode, the one the tests run in, holds these
+    /// patterns in the group each action names. `ask`, `deny` and `agent`
+    /// carry a sentence, as they do in a real file.
     fn cfg(rules: Vec<(&str, Action)>, unseen: Unseen) -> Config {
-        Config {
-            default_mode: None,
-            modes: Default::default(),
-            agent: Default::default(),
-            rules: rules
-                .into_iter()
-                .map(|(m, a)| Rule {
-                    pattern: m.to_string(),
-                    action: a,
-                    reason: Some("r".into()),
-                    context: Some("c".into()),
-                })
-                .collect(),
-            unseen,
+        let mut set = crate::config::RuleSet::default();
+        for (pattern, action) in rules {
+            let p = pattern.to_string();
+            match action {
+                Action::Allow => set.allow.push(p),
+                Action::Pass => set.pass.push(p),
+                Action::Ask => {
+                    set.ask.insert(p, "c".into());
+                }
+                Action::Deny => {
+                    set.deny.insert(p, "c".into());
+                }
+                Action::Agent => {
+                    set.agent.insert(p, String::new());
+                }
+            }
         }
-    }
-
-    fn verdicts(pairs: Vec<(&str, Action)>) -> Verdicts {
-        let mut v = Verdicts::default();
-        for (k, a) in pairs {
-            v.set(MODE, k, Entry { action: a, note: None, decided: None });
-        }
-        v
+        let mut modes = std::collections::BTreeMap::new();
+        modes.insert(
+            MODE.to_string(),
+            crate::config::Mode { description: None, unseen: Some(unseen), rules: set },
+        );
+        Config { default_mode: None, modes, judge: Default::default(), unseen }
     }
 
     const MODE: &str = "contributor";
 
-    fn run(c: &Config, v: &Verdicts, cmd: &str) -> Verdict {
-        run_judged(c, v, cmd, &mut |_| (Decision::Ask, None))
+    fn run(c: &Config, cmd: &str) -> Verdict {
+        run_judged(c, cmd, &mut |_, _| (Decision::Ask, None))
     }
 
-    fn run_judged(
-        c: &Config,
-        v: &Verdicts,
-        cmd: &str,
-        judge: &mut dyn FnMut(&str) -> (Decision, Option<String>),
-    ) -> Verdict {
+    fn run_judged(c: &Config, cmd: &str, judge: Judge) -> Verdict {
         evaluate(
             c,
-            v,
             &crate::parse::parse(cmd),
             "/tmp/askfirst-not-the-config-dir",
             MODE,
@@ -356,42 +377,38 @@ mod tests {
 
     #[test]
     fn an_unseen_command_asks_and_is_queued() {
-        let r = run(&cfg(vec![], Unseen::Ask), &verdicts(vec![]), "mystery-tool --go");
+        let r = run(&cfg(vec![], Unseen::Ask), "mystery-tool --go");
         assert_eq!(r.decision, Decision::Ask);
         assert_eq!(r.unseen.len(), 1);
         assert_eq!(r.unseen[0].0, "mystery-tool");
     }
 
     #[test]
-    fn a_learned_verdict_is_applied_and_not_requeued() {
-        let v = verdicts(vec![("cargo test", Action::Allow)]);
-        let r = run(&cfg(vec![], Unseen::Ask), &v, "cargo test --release");
+    fn a_decided_signature_is_applied_and_not_requeued() {
+        // What review writes is a rule like any other: the pattern it puts in
+        // the file is the signature plus a trailing `*`.
+        let c = cfg(vec![("cargo test *", Action::Allow)], Unseen::Ask);
+        let r = run(&c, "cargo test --release");
         assert_eq!(r.decision, Decision::Allow);
         assert!(r.unseen.is_empty());
     }
 
     #[test]
-    fn a_program_wide_verdict_covers_its_subcommands() {
-        let v = verdicts(vec![("ls", Action::Allow)]);
-        let r = run(&cfg(vec![], Unseen::Ask), &v, "ls -la /tmp");
-        assert_eq!(r.decision, Decision::Allow);
-    }
-
-    #[test]
-    fn a_written_rule_beats_a_learned_verdict() {
-        let v = verdicts(vec![("git push", Action::Allow)]);
-        let c = cfg(vec![("git push *", Action::Ask)], Unseen::Ask);
-        assert_eq!(run(&c, &v, "git push origin main").decision, Decision::Ask);
+    fn a_broadened_decision_covers_every_subcommand() {
+        // `b` during review writes the program alone.
+        let c = cfg(vec![("ls *", Action::Allow)], Unseen::Ask);
+        assert_eq!(run(&c, "ls -la /tmp").decision, Decision::Allow);
+        let c = cfg(vec![("git *", Action::Allow)], Unseen::Ask);
+        assert_eq!(run(&c, "git status --short").decision, Decision::Allow);
     }
 
     #[test]
     fn unknown_aliases_ask_without_any_discovery() {
         // The point of the ledger: askfirst does not need to know that `dot`
         // and `git publish` push. It has not seen them, so they stop.
-        let v = verdicts(vec![("git status", Action::Allow)]);
-        let c = cfg(vec![], Unseen::Ask);
+        let c = cfg(vec![("git status *", Action::Allow)], Unseen::Ask);
         for cmd in ["dot push", "git publish", "gj push", "hg push"] {
-            let r = run(&c, &v, cmd);
+            let r = run(&c, cmd);
             assert_eq!(r.decision, Decision::Ask, "{cmd} did not stop");
             assert_eq!(r.unseen.len(), 1, "{cmd} was not queued");
         }
@@ -399,7 +416,6 @@ mod tests {
 
     #[test]
     fn spellings_of_one_operation_share_a_signature() {
-        let v = verdicts(vec![]);
         let c = cfg(vec![], Unseen::Ask);
         for cmd in [
             "git push origin main",
@@ -408,66 +424,170 @@ mod tests {
             "/usr/bin/git push",
             "sudo git push",
         ] {
-            assert_eq!(run(&c, &v, cmd).unseen[0].0, "git push", "{cmd}");
+            assert_eq!(run(&c, cmd).unseen[0].0, "git push", "{cmd}");
         }
     }
 
     #[test]
-    fn running_askfirst_itself_always_asks() {
-        // Even with an allow verdict on it, and even in a permissive config.
-        let v = verdicts(vec![("askfirst review", Action::Allow), ("askfirst", Action::Allow)]);
-        let c = cfg(vec![("askfirst *", Action::Allow)], Unseen::Pass);
+    fn running_askfirst_asks_whatever_the_mode_would_do_with_it() {
+        // Not the mode's `unseen`: pass would let a session change the gate
+        // unseen, deny would swallow the command that leaves the mode.
+        for unseen in [Unseen::Pass, Unseen::Deny, Unseen::Ask] {
+            let c = cfg(vec![], unseen);
+            for cmd in ["askfirst review", "askfirst mode contributor", "askfirst mode godmode"] {
+                assert_eq!(run(&c, cmd).decision, Decision::Ask, "did not stop: {cmd}");
+            }
+        }
+        // And no spelling slips past it. These carry a second sub-command, so
+        // they are checked where that one decides nothing on its own.
+        let c = cfg(vec![], Unseen::Pass);
         for cmd in [
-            "askfirst review",
-            "askfirst mode contributor",
             "printf 'a\\n' | askfirst review",
             "ASKFIRST_HOME=/tmp/x askfirst review",
             "cd /tmp && askfirst review",
         ] {
-            assert_eq!(run(&c, &v, cmd).decision, Decision::Ask, "did not stop: {cmd}");
+            assert_eq!(run(&c, cmd).decision, Decision::Ask, "did not stop: {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_strict_neighbour_still_decides_the_whole_line() {
+        // Strictest wins across sub-commands, as everywhere else: pairing a
+        // mode switch with an uncategorised command in a mode that denies
+        // those refuses the line. The switch on its own is still approvable.
+        let c = cfg(vec![], Unseen::Deny);
+        assert_eq!(run(&c, "cd /tmp && askfirst mode contributor").decision, Decision::Deny);
+        assert_eq!(run(&c, "askfirst mode contributor").decision, Decision::Ask);
+    }
+
+    #[test]
+    fn a_rule_naming_askfirst_decides_it() {
+        // The ask is a default, not a floor. Naming the command in the rules
+        // file is deliberate, and the rules file is itself guarded.
+        let c = cfg(vec![("askfirst mode *", Action::Allow)], Unseen::Ask);
+        assert_eq!(run(&c, "askfirst mode reader").decision, Decision::Allow);
+        // Only what the rule names: review has no rule, so it still asks.
+        assert_eq!(run(&c, "askfirst review").decision, Decision::Ask);
+
+        let c = cfg(vec![("askfirst review *", Action::Deny)], Unseen::Ask);
+        assert_eq!(run(&c, "askfirst review").decision, Decision::Deny);
+    }
+
+    #[test]
+    fn a_catch_all_rule_does_not_decide_askfirst() {
+        // A rule written about other commands sweeps askfirst up without
+        // naming it. Letting it through would open the gate by accident.
+        for pattern in ["*", "* mode *"] {
+            let c = cfg(vec![(pattern, Action::Allow)], Unseen::Pass);
+            assert_eq!(
+                run(&c, "askfirst mode godmode").decision,
+                Decision::Ask,
+                "'{pattern}' should not decide askfirst"
+            );
         }
     }
 
     #[test]
     fn only_check_escapes_the_self_guard() {
         let c = cfg(vec![], Unseen::Pass);
-        let v = verdicts(vec![]);
         for cmd in ["askfirst review", "askfirst mode reader", "askfirst modes", "askfirst"] {
-            assert_eq!(run(&c, &v, cmd).decision, Decision::Ask, "should ask: {cmd}");
+            assert_eq!(run(&c, cmd).decision, Decision::Ask, "should ask: {cmd}");
         }
-        for cmd in ["askfirst check ls", "askfirst --check ls"] {
-            assert_eq!(run(&c, &v, cmd).decision, Decision::Pass, "should not ask: {cmd}");
-        }
+        assert_eq!(
+            run(&c, "askfirst check ls").decision,
+            Decision::Pass,
+            "check reports and changes nothing, so it does not ask"
+        );
     }
 
     #[test]
     fn a_wrapper_cannot_hide_a_self_call() {
         let c = cfg(vec![], Unseen::Pass);
-        let v = verdicts(vec![("sudo", Action::Allow), ("env", Action::Allow)]);
         for cmd in ["sudo askfirst review", "env askfirst mode reader", "/usr/bin/askfirst review"] {
-            assert_eq!(run(&c, &v, cmd).decision, Decision::Ask, "should ask: {cmd}");
+            assert_eq!(run(&c, cmd).decision, Decision::Ask, "should ask: {cmd}");
         }
     }
 
     #[test]
+    fn an_uncategorised_mode_switch_is_never_swallowed() {
+        // The lock-out this fixes: reader sets unseen = deny, `askfirst mode`
+        // has no rule and no verdict, so the deny swallowed the only way out
+        // of reader and no prompt was ever offered.
+        let c = cfg(vec![("git *", Action::Deny)], Unseen::Deny);
+        for cmd in ["askfirst mode contributor", "askfirst mode godmode", "askfirst review"] {
+            assert_eq!(
+                run(&c, cmd).decision,
+                Decision::Ask,
+                "must stay approvable: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_deny_on_askfirsts_files_still_denies() {
+        // Only invoking askfirst is capped at ask. A deny rule reaching its
+        // files is a boundary worth keeping.
+        let c = cfg(vec![("sed *", Action::Deny)], Unseen::Pass);
+        let r = run(
+            &c,
+            "sed -i s/a/b/ /tmp/askfirst-not-the-config-dir/rules.json",
+        );
+        assert_eq!(r.decision, Decision::Deny);
+    }
+
+    #[test]
     fn a_self_call_is_never_queued_for_review() {
-        let r = run(&cfg(vec![], Unseen::Ask), &verdicts(vec![]), "askfirst review");
+        let r = run(&cfg(vec![], Unseen::Ask), "askfirst review");
         assert!(r.unseen.is_empty(), "a self call must not earn its own verdict");
     }
 
     #[test]
+    fn an_agent_rule_hands_its_own_prompt_to_the_judge() {
+        let mut c = cfg(vec![("python3 *", Action::Agent)], Unseen::Ask);
+        c.modes.get_mut(MODE).unwrap().rules.agent.insert("python3 *".into(), "scripts in this repo only read.".into());
+        let mut seen: Vec<(String, Option<String>)> = Vec::new();
+        let mut judge = |cmd: &str, extra: Option<&str>| {
+            seen.push((cmd.to_string(), extra.map(str::to_string)));
+            (Decision::Allow, Some("policy says fine".into()))
+        };
+        let r = run_judged(&c, "python3 report.py", &mut judge);
+        assert_eq!(r.decision, Decision::Allow);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.as_deref(), Some("scripts in this repo only read."));
+        // An unseen command judged by the mode carries no rule prompt.
+        let mut plain = |_: &str, extra: Option<&str>| {
+            assert!(extra.is_none(), "unseen judging has no rule to take a prompt from");
+            (Decision::Allow, None)
+        };
+        let c = cfg(vec![], Unseen::Agent);
+        run_judged(&c, "cargo build", &mut plain);
+    }
+
+    #[test]
+    fn the_most_specific_of_two_equally_firm_rules_explains_the_stop() {
+        // Both deny; the one that names the flag is the one worth quoting.
+        let mut c = cfg(vec![], Unseen::Pass);
+        c.modes.get_mut(MODE).unwrap().rules.deny.insert("git *".into(), "git is off here.".into());
+        c.modes.get_mut(MODE).unwrap().rules.deny.insert("git push --force *".into(), "Force push rewrites history.".into());
+        let r = run(&c, "git push --force origin main");
+        assert_eq!(r.decision, Decision::Deny);
+        assert_eq!(r.reason.as_deref(), Some("Force push rewrites history."));
+    }
+
+    #[test]
     fn the_judge_is_consulted_only_for_unseen_signatures() {
-        let mut c = cfg(vec![("git push *", Action::Ask)], Unseen::Agent);
-        c.modes = Default::default();
-        let v = verdicts(vec![("ls", Action::Allow)]);
+        // `ls` has a rule, `git push` has a rule, only `cargo build` is new.
+        let c = cfg(
+            vec![("ls *", Action::Allow), ("git push *", Action::Ask)],
+            Unseen::Agent,
+        );
 
         let mut asked_about: Vec<String> = Vec::new();
-        let mut judge = |cmd: &str| {
+        let mut judge = |cmd: &str, _: Option<&str>| {
             asked_about.push(cmd.to_string());
             (Decision::Allow, Some("policy says fine".into()))
         };
-        let r = run_judged(&c, &v, "ls && git push && cargo build", &mut judge);
-        // ls has a verdict, git push has a rule, only cargo build is new.
+        let r = run_judged(&c, "ls && git push && cargo build", &mut judge);
         assert_eq!(asked_about.len(), 1, "judged: {asked_about:?}");
         assert!(asked_about[0].contains("cargo build"));
         // The rule's ask still wins over the judge's allow.
@@ -477,7 +597,7 @@ mod tests {
     #[test]
     fn the_judge_can_allow_an_unseen_command() {
         let c = cfg(vec![], Unseen::Agent);
-        let r = run_judged(&c, &verdicts(vec![]), "cargo build", &mut |_| {
+        let r = run_judged(&c, "cargo build", &mut |_, _| {
             (Decision::Allow, Some("policy says fine".into()))
         });
         assert_eq!(r.decision, Decision::Allow);
@@ -489,7 +609,7 @@ mod tests {
     #[test]
     fn a_judge_deny_outranks_a_judge_allow_elsewhere() {
         let c = cfg(vec![], Unseen::Agent);
-        let r = run_judged(&c, &verdicts(vec![]), "cargo build && curl http://x", &mut |cmd| {
+        let r = run_judged(&c, "cargo build && curl http://x", &mut |cmd, _| {
             if cmd.contains("curl") {
                 (Decision::Deny, Some("policy forbids network".into()))
             } else {
@@ -502,7 +622,7 @@ mod tests {
     #[test]
     fn an_unavailable_judge_falls_back_to_ask() {
         let c = cfg(vec![], Unseen::Agent);
-        let r = run_judged(&c, &verdicts(vec![]), "cargo build", &mut |_| {
+        let r = run_judged(&c, "cargo build", &mut |_, _| {
             (Decision::Ask, Some("judge unavailable (timed out after 20s)".into()))
         });
         assert_eq!(r.decision, Decision::Ask);
@@ -513,7 +633,7 @@ mod tests {
     fn the_judge_is_never_consulted_for_a_call_that_touches_askfirst() {
         let c = cfg(vec![], Unseen::Agent);
         let mut calls = 0;
-        let r = run_judged(&c, &verdicts(vec![]), "askfirst review", &mut |_| {
+        let r = run_judged(&c, "askfirst review", &mut |_, _| {
             calls += 1;
             (Decision::Allow, None)
         });
@@ -527,9 +647,8 @@ mod tests {
         // The case a signature cannot answer: `python3 x.py` says nothing
         // about what the script does.
         let c = cfg(vec![("python3 *", Action::Agent)], Unseen::Pass);
-        let v = verdicts(vec![]);
         let mut seen = Vec::new();
-        let r = run_judged(&c, &v, "python3 deploy.py --prod", &mut |cmd| {
+        let r = run_judged(&c, "python3 deploy.py --prod", &mut |cmd, _| {
             seen.push(cmd.to_string());
             (Decision::Ask, Some("the policy cannot tell what this script does".into()))
         });
@@ -543,7 +662,7 @@ mod tests {
     #[test]
     fn an_agent_rule_can_come_back_allow() {
         let c = cfg(vec![("python3 *", Action::Agent)], Unseen::Pass);
-        let r = run_judged(&c, &verdicts(vec![]), "python3 -c 'print(1)'", &mut |_| {
+        let r = run_judged(&c, "python3 -c 'print(1)'", &mut |_, _| {
             (Decision::Allow, Some("printing a number is harmless".into()))
         });
         assert_eq!(r.decision, Decision::Allow);
@@ -558,7 +677,7 @@ mod tests {
             Unseen::Pass,
         );
         let mut called = 0;
-        let r = run_judged(&c, &verdicts(vec![]), "python3 deploy.py", &mut |_| {
+        let r = run_judged(&c, "python3 deploy.py", &mut |_, _| {
             called += 1;
             (Decision::Allow, None)
         });
@@ -572,17 +691,18 @@ mod tests {
             vec![("python3 *", Action::Allow), ("python3 *", Action::Agent)],
             Unseen::Pass,
         );
-        let r = run_judged(&c, &verdicts(vec![]), "python3 x.py", &mut |_| {
+        let r = run_judged(&c, "python3 x.py", &mut |_, _| {
             (Decision::Deny, Some("this one is dangerous".into()))
         });
         assert_eq!(r.decision, Decision::Deny);
     }
 
     #[test]
-    fn an_agent_verdict_routes_to_the_judge_too() {
-        // What `askfirst review` writes when you pick "judge this every time".
-        let v = verdicts(vec![("python3", Action::Agent)]);
-        let r = run_judged(&cfg(vec![], Unseen::Pass), &v, "python3 x.py", &mut |_| {
+    fn a_judge_that_cannot_tell_asks() {
+        // `j` during review writes an `agent` rule, which is judged every time
+        // and never recorded, so nothing is learned from a hedge.
+        let c = cfg(vec![("python3 *", Action::Agent)], Unseen::Pass);
+        let r = run_judged(&c, "python3 x.py", &mut |_, _| {
             (Decision::Ask, Some("cannot tell".into()))
         });
         assert_eq!(r.decision, Decision::Ask);
@@ -590,14 +710,13 @@ mod tests {
     }
 
     #[test]
-    fn godmode_overrides_every_rule_and_verdict() {
+    fn godmode_overrides_every_rule() {
         // Rules that would otherwise deny, and a mode that is not even defined
         // in the config: godmode is decided in the binary.
         let c = cfg(
             vec![("* push *", Action::Ask), ("git push --force *", Action::Deny), ("rm *", Action::Deny)],
             Unseen::Deny,
         );
-        let v = verdicts(vec![("curl", Action::Deny)]);
         for cmd in [
             "rm -rf /",
             "git push --force origin main",
@@ -606,11 +725,10 @@ mod tests {
         ] {
             let r = evaluate(
                 &c,
-                &v,
                 &crate::parse::parse(cmd),
                 "/tmp/askfirst-not-the-config-dir",
                 crate::config::GODMODE,
-                &mut |_| (Decision::Deny, None),
+                &mut |_, _| (Decision::Deny, None),
             );
             assert_eq!(r.decision, Decision::Allow, "godmode did not allow: {cmd}");
             assert!(r.unseen.is_empty(), "godmode should not queue: {cmd}");
@@ -624,11 +742,10 @@ mod tests {
         for cmd in ["askfirst review", "askfirst mode reader"] {
             let r = evaluate(
                 &c,
-                &verdicts(vec![]),
                 &crate::parse::parse(cmd),
                 "/tmp/askfirst-not-the-config-dir",
                 crate::config::GODMODE,
-                &mut |_| (Decision::Allow, None),
+                &mut |_, _| (Decision::Allow, None),
             );
             assert_eq!(r.decision, Decision::Ask, "godmode let through: {cmd}");
         }
@@ -636,34 +753,28 @@ mod tests {
 
     #[test]
     fn strictest_segment_wins() {
-        let v = verdicts(vec![("ls", Action::Allow), ("git push", Action::Ask)]);
-        assert_eq!(
-            run(&cfg(vec![], Unseen::Ask), &v, "ls && git push").decision,
-            Decision::Ask
-        );
+        let c = cfg(vec![("ls *", Action::Allow), ("* push *", Action::Ask)], Unseen::Ask);
+        assert_eq!(run(&c, "ls && git push").decision, Decision::Ask);
     }
 
     #[test]
     fn one_unseen_segment_stops_an_otherwise_allowed_chain() {
-        let v = verdicts(vec![("ls", Action::Allow)]);
-        let r = run(&cfg(vec![], Unseen::Ask), &v, "ls && mystery-tool");
+        let c = cfg(vec![("ls *", Action::Allow)], Unseen::Ask);
+        let r = run(&c, "ls && mystery-tool");
         assert_eq!(r.decision, Decision::Ask);
         assert_eq!(r.unseen[0].0, "mystery-tool");
     }
 
     #[test]
-    fn a_deny_verdict_beats_an_allow_on_another_segment() {
-        let v = verdicts(vec![("ls", Action::Allow), ("curl", Action::Deny)]);
-        assert_eq!(
-            run(&cfg(vec![], Unseen::Ask), &v, "ls && curl http://x").decision,
-            Decision::Deny
-        );
+    fn a_deny_on_one_segment_beats_an_allow_on_another() {
+        let c = cfg(vec![("ls *", Action::Allow), ("curl *", Action::Deny)], Unseen::Ask);
+        assert_eq!(run(&c, "ls && curl http://x").decision, Decision::Deny);
     }
 
     #[test]
     fn everything_known_and_allowed_stays_quiet() {
-        let v = verdicts(vec![("ls", Action::Allow), ("cargo build", Action::Allow)]);
-        let r = run(&cfg(vec![], Unseen::Ask), &v, "ls && cargo build");
+        let c = cfg(vec![("ls *", Action::Allow), ("cargo build *", Action::Allow)], Unseen::Ask);
+        let r = run(&c, "ls && cargo build");
         assert_eq!(r.decision, Decision::Allow);
         assert!(r.unseen.is_empty());
     }
